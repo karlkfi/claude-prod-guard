@@ -40,7 +40,7 @@ KUBECONFIG_PROD = "apiVersion: v1\nkind: Config\ncurrent-context: gke_acme_prod-
 
 
 def make_home(kubeconfig=None, gcloud_project=None, docker_context=None,
-              az_subscription=None):
+              az_subscription=None, az_bom=False, argocd_context=None):
     """Build a synthetic $HOME holding whichever ambient configs a test needs."""
     home = tempfile.mkdtemp(prefix="prod-guard-test-home-")
     if kubeconfig is not None:
@@ -64,9 +64,17 @@ def make_home(kubeconfig=None, gcloud_project=None, docker_context=None,
     if az_subscription is not None:
         adir = os.path.join(home, ".azure")
         os.makedirs(adir)
-        with open(os.path.join(adir, "azureProfile.json"), "w", encoding="utf-8") as f:
+        # The Azure CLI writes this file with a UTF-8 byte order mark (BOM);
+        # az_bom reproduces that so the utf-8-sig read path is covered.
+        enc = "utf-8-sig" if az_bom else "utf-8"
+        with open(os.path.join(adir, "azureProfile.json"), "w", encoding=enc) as f:
             json.dump({"subscriptions": [
                 {"name": az_subscription, "isDefault": True}]}, f)
+    if argocd_context is not None:
+        adir = os.path.join(home, ".config", "argocd")
+        os.makedirs(adir)
+        with open(os.path.join(adir, "config"), "w", encoding="utf-8") as f:
+            f.write("current-context: %s\n" % argocd_context)
     return home
 
 
@@ -99,7 +107,12 @@ def run_hook(command, home=None, env_extra=None, cwd=None,
     if not r.stdout.strip():
         return None, None
     out = json.loads(r.stdout)["hookSpecificOutput"]
-    return out["permissionDecision"], out["permissionDecisionReason"]
+    decision = out["permissionDecision"]
+    # Invariant enforced on EVERY end-to-end call: the guard's only outputs
+    # are deny, ask, or silence. An `allow` would ride past the user's
+    # permission settings and the sibling guards — see docs/design.md.
+    assert decision in ("ask", "deny"), "guard emitted forbidden decision %r" % decision
+    return decision, out["permissionDecisionReason"]
 
 
 class ClassifyTests(unittest.TestCase):
@@ -669,6 +682,381 @@ class InfrastructureTests(unittest.TestCase):
             f.write("{not json")
         decision, _ = run_hook(
             "kubectl --context gke_acme_prod-us delete ns x", home=home)
+        self.assertEqual(decision, "deny")
+
+
+class BypassBatteryTests(unittest.TestCase):
+    """Adversarial command shapes: every case here is a form an agent (or a
+    prompt-injected agent) could plausibly emit to slip a prod mutation past
+    a naive first-token guard."""
+
+    def test_absolute_path_to_tool(self):
+        decision, _ = run_hook(
+            "/usr/local/bin/kubectl --context gke_acme_prod-us delete ns x")
+        self.assertEqual(decision, "deny")
+
+    def test_flag_after_verb(self):
+        decision, _ = run_hook("kubectl delete ns x --context gke_acme_prod-us")
+        self.assertEqual(decision, "deny")
+
+    def test_flag_equals_form_after_verb(self):
+        decision, _ = run_hook("kubectl delete ns x --context=gke_acme_prod-us")
+        self.assertEqual(decision, "deny")
+
+    def test_sudo_wrapper(self):
+        decision, _ = run_hook(
+            "sudo kubectl --context gke_acme_prod-us delete ns x")
+        self.assertEqual(decision, "deny")
+
+    def test_command_wrapper(self):
+        decision, _ = run_hook(
+            "command kubectl --context gke_acme_prod-us delete ns x")
+        self.assertEqual(decision, "deny")
+
+    def test_env_wrapper_with_assignment(self):
+        decision, _ = run_hook(
+            "env KUBECONFIG=/nonexistent kubectl --context gke_acme_prod-us delete ns x")
+        self.assertEqual(decision, "deny")
+
+    def test_xargs_pipeline(self):
+        home = make_home(kubeconfig=KUBECONFIG_KIND)
+        decision, _ = run_hook("echo x | xargs kubectl delete ns", home=home)
+        self.assertEqual(decision, "ask")
+
+    def test_nested_shell_two_levels(self):
+        decision, _ = run_hook(
+            "bash -c \"sh -c 'kubectl --context gke_acme_prod-us delete ns x'\"")
+        self.assertEqual(decision, "deny")
+
+    def test_recursion_depth_bound_is_a_known_limit(self):
+        # Beyond depth 3 the evaluator stops recursing — a DOCUMENTED false
+        # negative (README Limitations). This test locks the bound so a
+        # change to it is a conscious decision, not drift.
+        guard._PATTERNS = None
+        findings, override = guard.evaluate_command_string(
+            "kubectl --context gke_acme_prod-us delete ns x", {"cwd": "/"}, depth=4)
+        self.assertEqual(findings, [])
+        findings, _ = guard.evaluate_command_string(
+            "kubectl --context gke_acme_prod-us delete ns x", {"cwd": "/"}, depth=3)
+        self.assertEqual(len(findings), 1)
+
+    def test_unexpanded_variable_target_asks_not_defers(self):
+        # $CTX can't be resolved at hook time; it must classify UNKNOWN and
+        # prompt — silently deferring would let `CTX=prod ...` through.
+        decision, _ = run_hook("kubectl --context $CTX delete ns x")
+        self.assertEqual(decision, "ask")
+
+    def test_override_in_later_segment_applies(self):
+        decision, reason = run_hook(
+            "true && PROD_GUARD_OVERRIDE=drill kubectl --context gke_acme_prod-us delete ns x")
+        self.assertEqual(decision, "ask")
+        self.assertIn("override acknowledged", reason)
+
+    def test_assignment_only_segment_then_mutation(self):
+        decision, _ = run_hook(
+            "FOO=1; kubectl --context gke_acme_prod-us delete ns x")
+        self.assertEqual(decision, "deny")
+
+    def test_subshell_group_caught(self):
+        decision, _ = run_hook(
+            "(cd /srv && kubectl --context gke_acme_prod-us delete ns x)")
+        self.assertEqual(decision, "deny")
+
+    def test_or_chain_caught(self):
+        decision, _ = run_hook(
+            "true || kubectl --context gke_acme_prod-us delete ns x")
+        self.assertEqual(decision, "deny")
+
+    def test_background_ampersand_caught(self):
+        decision, _ = run_hook(
+            "kubectl --context gke_acme_prod-us delete ns x &")
+        self.assertEqual(decision, "deny")
+
+
+class VerbSweepTests(unittest.TestCase):
+    """Table-driven sweep: read-only verbs must defer even against an
+    explicit prod target; mutating verbs must deny against it. Locks the
+    verb tables against silent narrowing."""
+
+    KUBECTL_RO = [
+        "get pods", "describe pod x", "logs pod/x", "top pods", "diff -f m.yaml",
+        "explain deploy", "api-resources", "api-versions", "events",
+        "wait --for=condition=Ready pod/x", "auth can-i list pods",
+        "cluster-info", "rollout status deploy/x", "rollout history deploy/x",
+    ]
+    KUBECTL_MUT = [
+        "apply -f m.yaml", "delete ns x", "edit deploy/x", "patch deploy x -p {}",
+        "replace -f m.yaml", "scale deploy x --replicas=0", "annotate pod x k=v",
+        "label pod x k=v", "rollout restart deploy/x", "drain node-1",
+        "cordon node-1", "uncordon node-1", "taint nodes node-1 k=v:NoSchedule",
+        "exec -it pod-x -- sh", "cp pod-x:/f /tmp/f", "run tmp --image=busybox",
+        "expose deploy x --port=80", "set image deploy/x c=img:2",
+    ]
+
+    def test_kubectl_readonly_defers_on_prod(self):
+        for tail in self.KUBECTL_RO:
+            with self.subTest(tail=tail):
+                decision, _ = run_hook(
+                    "kubectl --context gke_acme_prod-us %s" % tail)
+                self.assertIsNone(decision)
+
+    def test_kubectl_mutating_denies_on_prod(self):
+        for tail in self.KUBECTL_MUT:
+            with self.subTest(tail=tail):
+                decision, _ = run_hook(
+                    "kubectl --context gke_acme_prod-us %s" % tail)
+                self.assertEqual(decision, "deny")
+
+    def test_helm_sweep(self):
+        for tail in ("list -A", "status api", "history api", "get values api"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook(
+                    "helm --kube-context acme-production %s" % tail)
+                self.assertIsNone(decision)
+        for tail in ("install api ./chart", "upgrade api ./chart",
+                     "uninstall api", "rollback api 1", "test api"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook(
+                    "helm --kube-context acme-production %s" % tail)
+                self.assertEqual(decision, "deny")
+
+    def test_aws_sweep(self):
+        for tail in ("ec2 describe-instances", "s3api list-buckets",
+                     "s3 ls s3://b", "sts get-caller-identity",
+                     "s3api head-object --bucket b --key k"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook("aws %s --profile prod" % tail)
+                self.assertIsNone(decision)
+        for tail in ("s3api put-object --bucket b --key k",
+                     "ec2 modify-instance-attribute --instance-id i-1",
+                     "s3api delete-bucket --bucket b", "s3 sync . s3://b",
+                     "s3 cp f s3://b/f", "s3 mv s3://b/a s3://b/c",
+                     "ec2 run-instances --image-id ami-1",
+                     "ec2 start-instances --instance-ids i-1",
+                     "rds reboot-db-instance --db-instance-identifier d"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook("aws %s --profile prod" % tail)
+                self.assertEqual(decision, "deny")
+
+    def test_gcloud_sweep(self):
+        for tail in ("compute instances list", "compute instances describe vm1",
+                     "projects get-iam-policy p", "run services list"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook("gcloud %s --project acme-prod" % tail)
+                self.assertIsNone(decision)
+        for tail in ("compute instances update vm1", "run deploy svc --image i",
+                     "projects add-iam-policy-binding p --member m --role r",
+                     "projects set-iam-policy p policy.json",
+                     "compute ssh vm1", "sql instances restart db1"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook("gcloud %s --project acme-prod" % tail)
+                self.assertEqual(decision, "deny")
+
+    def test_az_sweep(self):
+        for tail in ("vm show -n v -g rg", "vm list", "group list"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook(
+                    "az %s --subscription acme-prod-sub" % tail)
+                self.assertIsNone(decision)
+        for tail in ("vm update -n v -g rg", "vm start -n v -g rg",
+                     "vm stop -n v -g rg", "vm restart -n v -g rg",
+                     "vm deallocate -n v -g rg", "keyvault purge -n kv"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook(
+                    "az %s --subscription acme-prod-sub" % tail)
+                self.assertEqual(decision, "deny")
+
+    def test_terraform_sweep(self):
+        for verb in ("fmt", "validate", "show", "output", "providers", "graph"):
+            with self.subTest(verb=verb):
+                decision, _ = run_hook("TF_WORKSPACE=prod terraform %s" % verb)
+                self.assertIsNone(decision)
+        for verb in ("apply", "destroy", "import aws_x.y id", "taint aws_x.y",
+                     "untaint aws_x.y", "refresh"):
+            with self.subTest(verb=verb):
+                decision, _ = run_hook("TF_WORKSPACE=prod terraform %s" % verb)
+                self.assertEqual(decision, "deny")
+
+    def test_tofu_alias(self):
+        decision, _ = run_hook("TF_WORKSPACE=prod tofu apply")
+        self.assertEqual(decision, "deny")
+
+    def test_docker_sweep(self):
+        for tail in ("images", "inspect c1", "logs c1", "stats", "events",
+                     "history img"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook("docker --context prod-swarm %s" % tail)
+                self.assertIsNone(decision)
+        for tail in ("stop c1", "kill c1", "exec c1 sh", "run img",
+                     "system prune -f", "rmi img", "restart c1"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook("docker --context prod-swarm %s" % tail)
+                self.assertEqual(decision, "deny")
+
+    def test_flux_sweep(self):
+        for tail in ("get kustomizations", "logs", "check", "tree kustomization app",
+                     "export source git app"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook("flux %s --context acme-production" % tail)
+                self.assertIsNone(decision)
+        for tail in ("suspend kustomization app", "resume kustomization app",
+                     "reconcile kustomization app", "delete kustomization app",
+                     "create source git app --url u"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook("flux %s --context acme-production" % tail)
+                self.assertEqual(decision, "deny")
+
+
+class AmbientFixtureTests(unittest.TestCase):
+    """Edge cases in the local config-file readers."""
+
+    def test_azure_profile_with_bom(self):
+        home = make_home(az_subscription="Acme Production", az_bom=True)
+        decision, _ = run_hook("az vm delete -n v -g rg --yes", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_kubeconfig_env_multi_path_uses_first(self):
+        home = make_home()
+        kc1 = os.path.join(home, "kc-prod")
+        with open(kc1, "w", encoding="utf-8") as f:
+            f.write(KUBECONFIG_PROD)
+        decision, _ = run_hook(
+            "kubectl delete pod x", home=home,
+            env_extra={"KUBECONFIG": "%s:%s" % (kc1, os.path.join(home, "kc-other"))})
+        self.assertEqual(decision, "deny")
+
+    def test_kubeconfig_quoted_current_context(self):
+        home = make_home(
+            kubeconfig='apiVersion: v1\ncurrent-context: "gke_acme_prod-us"\n')
+        decision, _ = run_hook("kubectl delete pod x", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_kubeconfig_prefix_assignment_unresolvable_asks(self):
+        decision, _ = run_hook("KUBECONFIG=/nonexistent kubectl delete pod x")
+        self.assertEqual(decision, "ask")
+
+    def test_docker_config_without_current_context_defers(self):
+        home = make_home()
+        ddir = os.path.join(home, ".docker")
+        os.makedirs(ddir)
+        with open(os.path.join(ddir, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"auths": {}}, f)
+        decision, _ = run_hook("docker rm -f c1", home=home)
+        self.assertIsNone(decision)
+
+    def test_argocd_ambient_prod_denied(self):
+        home = make_home(argocd_context="argocd.prod.acme.io")
+        decision, _ = run_hook("argocd app sync api", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_argocd_ambient_unknown_asks(self):
+        home = make_home(argocd_context="argocd.internal")
+        decision, _ = run_hook("argocd app sync api", home=home)
+        self.assertEqual(decision, "ask")
+
+
+class SpecialCaseTests(unittest.TestCase):
+    """Branches for commands that mutate shared local state (kubeconfig
+    writers, credential/context switchers) and registry-classified pushes."""
+
+    def test_eksctl_write_kubeconfig_asks(self):
+        decision, reason = run_hook(
+            "eksctl utils write-kubeconfig --cluster dev-main")
+        self.assertEqual(decision, "ask")
+        self.assertIn("kubeconfig", reason)
+
+    def test_doctl_kubeconfig_save_asks(self):
+        decision, reason = run_hook(
+            "doctl kubernetes cluster kubeconfig save c1")
+        self.assertEqual(decision, "ask")
+        self.assertIn("kubeconfig", reason)
+
+    def test_az_login_and_account_clear_ask(self):
+        for cmd in ("az login", "az logout", "az account clear"):
+            with self.subTest(cmd=cmd):
+                decision, _ = run_hook(cmd)
+                self.assertEqual(decision, "ask")
+
+    def test_terraform_login_asks(self):
+        decision, _ = run_hook("terraform login")
+        self.assertEqual(decision, "ask")
+
+    def test_terraform_state_push_asks(self):
+        decision, _ = run_hook("terraform state push errored.tfstate")
+        self.assertEqual(decision, "ask")
+
+    def test_gcloud_auth_login_asks_list_defers(self):
+        decision, _ = run_hook("gcloud auth login")
+        self.assertEqual(decision, "ask")
+        decision, _ = run_hook("gcloud auth list")
+        self.assertIsNone(decision)
+
+    def test_kubectl_config_delete_context_asks(self):
+        decision, _ = run_hook("kubectl config delete-context old-ctx")
+        self.assertEqual(decision, "ask")
+
+    def test_kubectx_delete_and_previous_ask(self):
+        decision, _ = run_hook("kubectx -d old-ctx")
+        self.assertEqual(decision, "ask")
+        decision, _ = run_hook("kubectx -")
+        self.assertEqual(decision, "ask")
+
+    def test_helm_push_registry_classified(self):
+        decision, _ = run_hook(
+            "helm push chart.tgz oci://registry.prod.acme.io/charts")
+        self.assertEqual(decision, "deny")
+        decision, _ = run_hook(
+            "helm push chart.tgz oci://127.0.0.1:5000/charts")
+        self.assertIsNone(decision)
+        decision, _ = run_hook(
+            "helm push chart.tgz oci://ghcr.io/acme/charts")
+        self.assertEqual(decision, "ask")
+
+    def test_docker_build_push_tag_classified(self):
+        decision, _ = run_hook(
+            "docker build --push -t registry.prod.acme.io/app:1 .")
+        self.assertEqual(decision, "deny")
+        decision, _ = run_hook("docker build --push -t ghcr.io/acme/app:1 .")
+        self.assertEqual(decision, "ask")
+        decision, _ = run_hook("docker build --push -t 127.0.0.1:5000/app:1 .")
+        self.assertIsNone(decision)
+
+    def test_gh_repo_env_var_target(self):
+        decision, _ = run_hook("GH_REPO=acme/prod-app gh workflow run deploy")
+        self.assertEqual(decision, "deny")
+
+    def test_gcloud_configurations_activate_asks(self):
+        decision, _ = run_hook("gcloud config configurations activate other")
+        self.assertEqual(decision, "ask")
+        decision, _ = run_hook("gcloud config configurations list")
+        self.assertIsNone(decision)
+
+
+class RobustnessTests(unittest.TestCase):
+    """The hook must never crash (PROD_GUARD_DEBUG=1 in run_hook re-raises
+    any exception as a nonzero exit) and never emit `allow` (asserted inside
+    run_hook on every call), whatever the input shape."""
+
+    GARBAGE = [
+        ";;;", "((((", "))))", "&& kubectl", "kubectl |", "| | |",
+        "kubectl --context", "kubectl --context=",
+        "kubectl üñîçødé delete",
+        "a" * 10000,
+        "kubectl " + "-x " * 500 + "delete",
+        "docker push", "helm push", "gh api", "terraform", "eval", "bash -c",
+        "bash -c ''", "xargs", "sudo", "env", "timeout 5",
+        "kubectl delete\x0b\x0cpod",
+    ]
+
+    def test_garbage_corpus_never_crashes(self):
+        for cmd in self.GARBAGE:
+            with self.subTest(cmd=cmd[:40]):
+                run_hook(cmd)  # run_hook raises on crash or forbidden output
+
+    def test_long_chain_evaluates_all_segments(self):
+        chain = " && ".join(["true"] * 50
+                            + ["kubectl --context gke_acme_prod-us delete ns x"])
+        decision, _ = run_hook(chain)
         self.assertEqual(decision, "deny")
 
 
