@@ -34,6 +34,7 @@ config — classifies that target against configurable patterns, and:
 - [Configuration](#configuration)
 - [The override escape hatch](#the-override-escape-hatch)
 - [Agent guidance: avoiding prompts](#agent-guidance-avoiding-prompts)
+- [Measuring friction](#measuring-friction)
 - [Limitations](#limitations)
 - [Companion plugins](#companion-plugins)
 - [Design](#design)
@@ -278,6 +279,32 @@ ambient context. To keep work flowing:
 - **Production mutations are blocked.** If one is genuinely intended, ask
   the user; with their sign-off, prefix the command with
   `PROD_GUARD_OVERRIDE=<reason>` and they will confirm via the prompt.
+```
+
+## Measuring friction
+
+To see which prod-guard prompts actually cost you time — and which unknown
+targets prompt over and over — run the friction report:
+
+```
+/prod-guard:friction-report              # last 7 days
+/prod-guard:friction-report --since 24h
+/prod-guard:friction-report --json       # machine-readable
+```
+
+It is a **read-only** analyzer: it re-reads the decisions Claude Code already
+recorded in your local session transcripts and adds no telemetry (see
+[PRIVACY.md](PRIVACY.md)). The report ranks prompts by category (`deny-prod`,
+`ask-unknown`, `ask-ambient`, `ask-switch`), by tool, and — most usefully — by
+**unclassified target**: the non-prod names that keep landing in `ask-unknown`
+are exactly the ones to add under `"nonprod"` in `.claude/prod-guard.json` (see
+[Configuration](#configuration)). Vet each before adding — never reclassify a
+real production target as non-prod just to silence a prompt.
+
+You can also run the script directly:
+
+```
+python3 scripts/friction-report.py --since 30d --repo gateway --top 20
 ```
 
 ## Limitations
