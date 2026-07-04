@@ -372,18 +372,26 @@ def words_of(argv, value_flags=()):
 # single `git config` lookup for gh (local, no network), no cluster calls.
 # ---------------------------------------------------------------------------
 
-def kube_current_context(seg_env):
-    """current-context from $KUBECONFIG (first path) or ~/.kube/config."""
+def _kubeconfig_paths(seg_env):
+    """Every kubeconfig file to consult: all `:`-separated $KUBECONFIG paths
+    (kubectl merges them), else ~/.kube/config. Empty if $HOME is unset and no
+    $KUBECONFIG is given."""
     kc = seg_env.get('KUBECONFIG') or os.environ.get('KUBECONFIG')
     if kc:
-        path = kc.split(':')[0]
-    else:
-        home = os.environ.get('HOME')
-        if not home:
-            return None
-        path = os.path.join(home, '.kube', 'config')
+        return [p for p in kc.split(':') if p]
+    home = os.environ.get('HOME')
+    if home:
+        return [os.path.join(home, '.kube', 'config')]
+    return []
+
+
+def kube_current_context(seg_env):
+    """current-context from $KUBECONFIG (first path) or ~/.kube/config."""
+    paths = _kubeconfig_paths(seg_env)
+    if not paths:
+        return None
     try:
-        with open(path, encoding='utf-8') as f:
+        with open(paths[0], encoding='utf-8') as f:
             for line in f:
                 m = re.match(r'^current-context:\s*["\']?([^"\'\n#]+)', line)
                 if m:
@@ -391,6 +399,106 @@ def kube_current_context(seg_env):
     except OSError:
         return None
     return None
+
+
+def _kube_yaml_field(item_lines, key):
+    """First inline `key: value` in a kubeconfig list item, quotes stripped.
+    Block keys (`cluster:` with no inline value, i.e. a nested map) don't
+    match, so the same key name resolves to the scalar field, never the map."""
+    rx = re.compile(r'^\s*(?:-\s+)?' + re.escape(key) + r':\s*(.+?)\s*$')
+    for line in item_lines:
+        m = rx.match(line)
+        if m:
+            return m.group(1).strip('"\'') or None
+    return None
+
+
+def _parse_kubeconfig(path):
+    """(ctx_to_cluster, cluster_to_server) from one kubeconfig file.
+
+    Line-oriented parse of the block-style subset `kubectl config` writes:
+    track the top-level `clusters:` / `contexts:` section, split each into list
+    items on `- ` lines, and read the scalar fields from each item. Anything it
+    can't parse (flow style, unreadable file) yields empty maps — the caller
+    falls back to name-only classification, so this only ever *adds* a chance
+    to classify, never removes one."""
+    ctx_to_cluster, cluster_to_server = {}, {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError:
+        return ctx_to_cluster, cluster_to_server
+
+    section = None
+    item = []
+
+    def flush():
+        if not item:
+            return
+        name = _kube_yaml_field(item, 'name')
+        if not name:
+            return
+        if section == 'clusters':
+            server = _kube_yaml_field(item, 'server')
+            if server and name not in cluster_to_server:  # first-wins merge
+                cluster_to_server[name] = server
+        elif section == 'contexts':
+            cluster = _kube_yaml_field(item, 'cluster')
+            if cluster and name not in ctx_to_cluster:
+                ctx_to_cluster[name] = cluster
+
+    for line in lines:
+        top = re.match(r'^([A-Za-z0-9_-]+):', line)
+        if top:  # a new top-level key ends the current section/item
+            flush()
+            item = []
+            section = top.group(1) if top.group(1) in ('clusters', 'contexts') else None
+            continue
+        if section is None:
+            continue
+        if re.match(r'^\s*-\s', line) or re.match(r'^\s*-\s*$', line):
+            flush()
+            item = [line]
+        elif item:
+            item.append(line)
+    flush()
+    return ctx_to_cluster, cluster_to_server
+
+
+def kube_context_server(name, seg_env):
+    """Resolve a context name to its cluster's server URL, merging every
+    kubeconfig file. None if the context, its cluster, or the server can't be
+    resolved (parse failure, split-across-unread-files, etc.)."""
+    if not name:
+        return None
+    ctx_to_cluster, cluster_to_server = {}, {}
+    for path in _kubeconfig_paths(seg_env):
+        c2c, c2s = _parse_kubeconfig(path)
+        for k, v in c2c.items():
+            ctx_to_cluster.setdefault(k, v)
+        for k, v in c2s.items():
+            cluster_to_server.setdefault(k, v)
+    cluster = ctx_to_cluster.get(name)
+    if not cluster:
+        return None
+    return cluster_to_server.get(cluster)
+
+
+def classify_kube(name, seg_env):
+    """Classify a kube-context by the worst (most prod-leaning) of its name
+    and its cluster's server URL, on the prod > nonprod > unknown lattice.
+    Additive to name-only classify(): a prod server upgrades an innocuously
+    named context to prod; an unresolvable server leaves the name verdict
+    untouched."""
+    name_cls = classify(name)
+    if name_cls == 'prod':
+        return 'prod'  # prod wins; no need to resolve the server
+    server_cls = classify(kube_context_server(name, seg_env))
+    if server_cls == 'prod':
+        return 'prod'
+    if name_cls == 'nonprod' or server_cls == 'nonprod':
+        return 'nonprod'
+    return 'unknown'
 
 
 def gcloud_active_project():
@@ -542,11 +650,13 @@ def ask_switch(action, what):
 
 
 def policy(action, explicit_value, explicit_desc,
-           ambient_value, ambient_desc, pin_hint):
+           ambient_value, ambient_desc, pin_hint, classify_fn=classify):
     """The shared decision matrix for a mutating verb, given how the target
-    resolved. Returns a finding tuple or None (defer)."""
+    resolved. Returns a finding tuple or None (defer). `classify_fn` lets a
+    tool refine classification (e.g. kube resolves the context's server URL);
+    it defaults to the plain name-based classify()."""
     if explicit_value is not None:
-        cls = classify(explicit_value)
+        cls = classify_fn(explicit_value)
         if cls == 'prod':
             return deny_prod(action, explicit_desc)
         if cls == 'nonprod':
@@ -554,7 +664,7 @@ def policy(action, explicit_value, explicit_desc,
         return ask_unknown(action, explicit_desc)
     # No explicit pin: the target is whatever the shared ambient state says.
     if ambient_value is not None:
-        if classify(ambient_value) == 'prod':
+        if classify_fn(ambient_value) == 'prod':
             return deny_prod(action, ambient_desc + ' (ambient)')
         return ask_ambient(action, ambient_desc, pin_hint)
     return ask_ambient(action, ambient_desc, pin_hint)
@@ -727,7 +837,7 @@ def eval_kubectl(argv, seg_env, ctx):
             return []
         if sub == 'use-context':
             name = words[2] if len(words) > 2 else None
-            if name and classify(name) == 'prod':
+            if name and classify_kube(name, seg_env) == 'prod':
                 return [deny_prod(action, "kube-context '%s'" % name)]
             return [ask_switch(action, 'the shared kubeconfig current-context')]
         # set/set-context/delete-context/rename-context/unset/...: mutations
@@ -748,7 +858,8 @@ def eval_kubectl(argv, seg_env, ctx):
             return []  # bare `oc project` only prints the current project
         return [ask_switch(action, 'the shared kubeconfig (current project of the context)')]
     explicit, edesc, ambient, adesc = _kube_target(argv, seg_env, ('--context',))
-    f = policy(action, explicit, edesc, ambient, adesc, 'kubectl --context <ctx>')
+    f = policy(action, explicit, edesc, ambient, adesc, 'kubectl --context <ctx>',
+               classify_fn=lambda v: classify_kube(v, seg_env))
     return [f] if f else []
 
 
@@ -770,7 +881,8 @@ def eval_helm(argv, seg_env, ctx):
     if verb in HELM_LOCAL_OR_READONLY:
         return []
     explicit, edesc, ambient, adesc = _kube_target(argv, seg_env, ('--kube-context',))
-    f = policy(action, explicit, edesc, ambient, adesc, 'helm --kube-context <ctx>')
+    f = policy(action, explicit, edesc, ambient, adesc, 'helm --kube-context <ctx>',
+               classify_fn=lambda v: classify_kube(v, seg_env))
     return [f] if f else []
 
 
@@ -781,7 +893,8 @@ def eval_flux(argv, seg_env, ctx):
     if verb is None or verb in FLUX_READONLY:
         return []
     explicit, edesc, ambient, adesc = _kube_target(argv, seg_env, ('--context',))
-    f = policy(action, explicit, edesc, ambient, adesc, 'flux --context <ctx>')
+    f = policy(action, explicit, edesc, ambient, adesc, 'flux --context <ctx>',
+               classify_fn=lambda v: classify_kube(v, seg_env))
     return [f] if f else []
 
 
@@ -796,7 +909,7 @@ def eval_kubectx(argv, seg_env, ctx):
     name = args[0]
     if name == '-':
         return [ask_switch('kubectx -', 'the shared kubeconfig current-context')]
-    if classify(name) == 'prod':
+    if classify_kube(name, seg_env) == 'prod':
         return [deny_prod('kubectx %s' % name, "kube-context '%s'" % name)]
     return [ask_switch('kubectx %s' % name, 'the shared kubeconfig current-context')]
 
