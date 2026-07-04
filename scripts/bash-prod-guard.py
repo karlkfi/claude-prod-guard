@@ -1439,6 +1439,172 @@ def eval_doctl(argv, seg_env, ctx):
                         'doctl --context <name>')]
 
 
+# pulumi verbs that only read or act locally — everything else (up/update,
+# destroy, refresh, import, cancel, watch, state ..., unknown) is mutating.
+PULUMI_READONLY = frozenset({
+    'preview', 'about', 'version', 'whoami', 'logs', 'console', 'plugin',
+    'convert', 'install', 'schema', 'help', 'completion',
+})
+# pulumi `stack` subcommands that only read.
+PULUMI_STACK_READONLY = frozenset({'ls', 'output', 'export', 'history', 'graph'})
+# Value-taking flags, so a value placed before the verb isn't read as one.
+PULUMI_VALUE_FLAGS = (
+    '--stack', '-s', '--cwd', '-C', '--color', '--tracing', '--profiling',
+    '--config-file', '--policy-pack', '--secrets-provider', '-m', '--message',
+)
+
+
+def _pulumi_decide(action, explicit):
+    """Classify an explicit pulumi stack (flag or positional); no stack pinned
+    -> ask_ambient. The ambient selected stack is not read from disk in v1
+    (see the pulumi-ansible-coverage plan doc)."""
+    if explicit is not None:
+        cls = classify(explicit)
+        if cls == 'prod':
+            return [deny_prod(action, "pulumi stack '%s'" % explicit)]
+        if cls == 'nonprod':
+            return []
+        return [ask_unknown(action, "pulumi stack '%s'" % explicit)]
+    return [ask_ambient(action, 'the ambient selected pulumi stack '
+                        '(unresolved at hook time)', 'pulumi --stack <name>')]
+
+
+def eval_pulumi(argv, seg_env, ctx):
+    words = words_of(argv, PULUMI_VALUE_FLAGS)
+    action = action_of(argv, words)
+    verb = words[0].lower() if words else None
+    if verb is None or verb in PULUMI_READONLY:
+        return []
+    if verb in ('login', 'logout'):
+        return [ask_switch(action, 'the shared pulumi credentials/backend')]
+    if verb == 'stack':
+        sub = words[1].lower() if len(words) > 1 else None
+        if sub is None or sub in PULUMI_STACK_READONLY:
+            return []
+        name = words[2] if len(words) > 2 else first_flag_value(argv, ('--stack', '-s'))
+        if sub in ('select', 'unselect'):
+            if name and classify(name) == 'prod':
+                return [deny_prod(action, "pulumi stack '%s'" % name)]
+            return [ask_switch(action, 'the selected pulumi stack')]
+        # init/rm/rename/tag/import/change-secrets-provider: mutate the stack.
+        return _pulumi_decide(action, name)
+    if verb == 'config':
+        sub = words[1].lower() if len(words) > 1 else None
+        if sub is None or sub == 'get':
+            return []
+        # set/rm/set-all/rm-all/cp/refresh: mutate the selected stack's config.
+    return _pulumi_decide(action, first_flag_value(argv, ('--stack', '-s')))
+
+
+# ansible ad-hoc modules that only read remote state (no change).
+ANSIBLE_READONLY_MODULES = frozenset({'ping', 'setup', 'debug', 'gather_facts'})
+# Inspection flags that make even ansible-playbook read-only (never connect).
+ANSIBLE_READONLY_FLAGS = ('--syntax-check', '--list-hosts', '--list-tasks',
+                          '--list-tags')
+# Value-taking flags, so their values aren't mistaken for the host pattern.
+ANSIBLE_VALUE_FLAGS = frozenset({
+    '-i', '--inventory', '--inventory-file', '-l', '--limit',
+    '-m', '--module-name', '-a', '--args', '-e', '--extra-vars',
+    '-u', '--user', '--become-user', '--become-method',
+    '-c', '--connection', '-T', '--timeout', '-f', '--forks',
+    '-M', '--module-path', '-t', '--tree', '--start-at-task',
+    '--tags', '--skip-tags', '--vault-id', '--vault-password-file',
+    '--private-key', '--key-file', '--ssh-common-args', '--ssh-extra-args',
+    '--scp-extra-args', '--sftp-extra-args', '-P', '--poll', '-B', '--background',
+})
+
+
+def _ansible_pattern(argv):
+    """First positional token of an ad-hoc `ansible` command — the host
+    pattern — skipping flags and their values."""
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ANSIBLE_VALUE_FLAGS:
+            i += 2
+            continue
+        if tok.startswith('-'):
+            i += 1
+            continue
+        return tok
+    return None
+
+
+def _ini_inventory(path):
+    """`inventory = <value>` under `[defaults]` in an ansible.cfg (INI). None
+    if absent/unreadable — fail OPEN."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            section = None
+            for line in f:
+                s = line.strip()
+                if s.startswith('[') and s.endswith(']'):
+                    section = s[1:-1].strip().lower()
+                    continue
+                if section == 'defaults':
+                    m = re.match(r'inventory\s*=\s*(.+?)\s*(?:[;#].*)?$', s)
+                    if m:
+                        return m.group(1).strip() or None
+    except OSError:
+        return None
+    return None
+
+
+def ansible_ambient_inventory(seg_env, cwd):
+    """The inventory ansible would use with no `-i`: ANSIBLE_INVENTORY, then
+    the `[defaults] inventory` of ANSIBLE_CONFIG / ./ansible.cfg. None if
+    unresolved (the default /etc/ansible/hosts is unnamed — nothing to
+    classify)."""
+    inv = seg_env.get('ANSIBLE_INVENTORY') or os.environ.get('ANSIBLE_INVENTORY')
+    if inv:
+        return inv
+    cfg = seg_env.get('ANSIBLE_CONFIG') or os.environ.get('ANSIBLE_CONFIG')
+    paths = ([cfg] if cfg else []) + [os.path.join(cwd or '.', 'ansible.cfg')]
+    for p in paths:
+        val = _ini_inventory(p)
+        if val:
+            return val
+    return None
+
+
+def eval_ansible(argv, seg_env, ctx):
+    """ansible / ansible-playbook target the *inventory* (which hosts a play
+    runs against). The inventory is authoritative for classification; the host
+    pattern and `--limit` can only escalate a decision to deny, never force an
+    ask when the inventory itself resolves nonprod."""
+    adhoc = os.path.basename(argv[0]) == 'ansible'
+    if any(f in argv for f in ANSIBLE_READONLY_FLAGS):
+        return []  # --syntax-check/--list-* never connect or change anything
+    if adhoc:
+        module = first_flag_value(argv, ('-m', '--module-name'))
+        if module and module.split('.')[-1] in ANSIBLE_READONLY_MODULES:
+            return []  # ping/setup/debug: read-only even against prod
+    invs = all_flag_values(argv, ('-i', '--inventory', '--inventory-file'))
+    limits = all_flag_values(argv, ('-l', '--limit'))
+    pattern = _ansible_pattern(argv) if adhoc else None
+    escalators = list(limits) + ([pattern] if pattern else [])
+    action = ('ansible %s' % pattern if adhoc and pattern
+              else os.path.basename(argv[0]))
+    for t in invs + escalators:
+        if classify(t) == 'prod':
+            return [deny_prod(action, "the ansible target '%s'" % t)]
+    if invs:
+        for v in invs:
+            if classify(v) == 'unknown':
+                return [ask_unknown(action, "the ansible inventory '%s'" % v)]
+        return []  # every -i inventory classifies nonprod
+    ambient = ansible_ambient_inventory(seg_env, ctx.get('cwd'))
+    if ambient is not None:
+        cls = classify(ambient)
+        if cls == 'prod':
+            return [deny_prod(action, "the ambient ansible inventory '%s'" % ambient)]
+        if cls == 'nonprod':
+            return []
+    return [ask_ambient(action, 'the ambient ansible inventory '
+                        '(ANSIBLE_INVENTORY / ansible.cfg / /etc/ansible/hosts)',
+                        '-i <inventory>')]
+
+
 def eval_kustomize(argv, seg_env, ctx):
     # kustomize only renders/edits local files; the cluster mutation happens
     # in whatever kubectl/helm it pipes into, which gets its own segment.
@@ -1466,6 +1632,9 @@ EVALUATORS = {
     'argocd': eval_argocd,
     'eksctl': eval_eksctl,
     'doctl': eval_doctl,
+    'pulumi': eval_pulumi,
+    'ansible': eval_ansible,
+    'ansible-playbook': eval_ansible,
     'kustomize': eval_kustomize,
 }
 COVERED_TOOLS = frozenset(EVALUATORS)
