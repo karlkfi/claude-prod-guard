@@ -171,7 +171,7 @@ mode that matters.
 | `helm` | `--kube-context` | same kubeconfig `current-context` |
 | `gcloud` | `--project` / `--zone` / `--region` / `--account`, `CLOUDSDK_CORE_PROJECT` | project of the active gcloud configuration |
 | `aws` | `--profile` / `--region`, `AWS_PROFILE` | the `[default]` profile's `sso_start_url` / `role_arn` / `sso_session` in `~/.aws/config` (or `$AWS_CONFIG_FILE`) — a prod account denies, otherwise prompts |
-| `eksctl` | `--profile` / `--region`, `AWS_PROFILE` | the default profile (never read — always prompts) |
+| `eksctl` | `--profile` / `--region`, `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | the `[default]` profile in `~/.aws/config`, resolved exactly as for `aws` — a prod account denies, otherwise prompts |
 | `az` | `--subscription` | default subscription in `~/.azure/azureProfile.json` |
 | `terraform` / `tofu` | `TF_WORKSPACE` | `.terraform/environment` in the working dir; the initialized backend's state location (S3/GCS bucket, Terraform Cloud org/workspace) from `.terraform/terraform.tfstate` is classified too, so a prod state location denies even behind an innocuous workspace name; `apply`/`destroy` are always treated as mutating |
 | `docker`, `podman`, `nerdctl`, `docker-compose` | `--context` / `--connection`, `DOCKER_HOST` / `CONTAINER_HOST` | `currentContext` in `~/.docker/config.json`; a local-daemon context defers. `docker push` classifies the image ref's registry; `build --push` classifies **every** `-t` tag; `compose push` fails closed (the registry lives in the compose file, which the hook doesn't parse) |
@@ -338,8 +338,7 @@ python3 scripts/friction-report.py --since 30d --repo gateway --top 20
 - The doctl auth context and pulumi's selected stack are not read from disk; a
   mutating command relying on them always prompts rather than resolving the
   ambient value (`pulumi stack select <prod>` is still denied, so choosing a
-  prod stack is caught). `eksctl`'s ambient AWS profile is likewise not read —
-  unlike a bare `aws` command, whose `[default]` profile *is* resolved.
+  prod stack is caught).
 - Ambient state is read at *hook* time; a race remains between the hook's
   check and the command's execution. Pinning the target with a flag — which
   the ask message steers toward — is the real fix; the prompt exists to

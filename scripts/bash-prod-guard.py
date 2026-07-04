@@ -1116,6 +1116,31 @@ def eval_gcloud(argv, seg_env, ctx):
     return [ask_ambient(action, desc, 'gcloud --project <id>')]
 
 
+def ambient_aws_default_profile_decision(action, seg_env, pin,
+                                         generic_desc, named_desc):
+    """Escalate the ambient ~/.aws/config [default] profile to a decision: a
+    prod signal in any resolved field denies; otherwise a naming (or generic)
+    ambient ask. Shared by eval_aws and eval_eksctl, which both reach AWS
+    through the same default-profile chain. Additive-only: content moves the
+    call unknown -> deny, never unknown -> defer.
+
+    named_desc is a %-format template taking the most-identifying resolved
+    field; generic_desc is used when nothing echoable resolved."""
+    resolved = aws_default_profile(seg_env)
+    if resolved is not None:
+        named, extra = resolved
+        for v in named:
+            if classify(v) == 'prod':
+                return deny_prod(action,
+                                 "the default aws profile (%s) (ambient)" % v)
+        for v in extra:
+            if classify(v) == 'prod':
+                return deny_prod(action, 'the default aws profile (ambient)')
+        if named:
+            return ask_ambient(action, named_desc % named[0], pin)
+    return ask_ambient(action, generic_desc, pin)
+
+
 def eval_aws(argv, seg_env, ctx):
     words = words_of(argv, ('--profile', '--region', '--output', '--query'))
     action = action_of(argv, words)
@@ -1151,20 +1176,10 @@ def eval_aws(argv, seg_env, ctx):
     # (ambient), now naming what resolved. Purely additive over the prior
     # always-ask — a missing/unreadable config resolves nothing.
     pin = 'aws --profile <name> (or AWS_PROFILE=<name>)'
-    resolved = aws_default_profile(seg_env)
-    if resolved is not None:
-        named, extra = resolved
-        for v in named:
-            if classify(v) == 'prod':
-                return [deny_prod(action,
-                        "the default aws profile (%s) (ambient)" % v)]
-        for v in extra:
-            if classify(v) == 'prod':
-                return [deny_prod(action, 'the default aws profile (ambient)')]
-        if named:
-            return [ask_ambient(
-                action, "the ambient default aws profile (%s)" % named[0], pin)]
-    return [ask_ambient(action, 'the ambient default aws profile', pin)]
+    return [ambient_aws_default_profile_decision(
+        action, seg_env, pin,
+        'the ambient default aws profile',
+        "the ambient default aws profile (%s)")]
 
 
 def eval_az(argv, seg_env, ctx):
@@ -1486,7 +1501,9 @@ def eval_eksctl(argv, seg_env, ctx):
     if verb == 'utils' and len(words) > 1 and words[1] == 'write-kubeconfig':
         return [ask_switch(action, 'the shared kubeconfig (writes a new context)')]
     flags = flag_values(argv, ('--cluster', '--name', '--region', '--profile'))
-    profile = seg_env.get('AWS_PROFILE') or os.environ.get('AWS_PROFILE')
+    profile = (seg_env.get('AWS_PROFILE') or os.environ.get('AWS_PROFILE')
+               or seg_env.get('AWS_DEFAULT_PROFILE')
+               or os.environ.get('AWS_DEFAULT_PROFILE'))
     values = list(flags.values()) + ([profile] if profile else [])
     if values:
         descs = ', '.join("'%s'" % v for v in values)
@@ -1496,8 +1513,13 @@ def eval_eksctl(argv, seg_env, ctx):
         if 'nonprod' in classes:
             return []
         return [ask_unknown(action, 'the eks cluster/profile %s' % descs)]
-    return [ask_ambient(action, 'the ambient aws profile/region',
-                        'eksctl --cluster <name> --profile <name>')]
+    # Nothing pinned (no flags, no AWS_PROFILE/AWS_DEFAULT_PROFILE): eksctl
+    # reaches AWS through the ~/.aws/config [default] profile, so resolve it
+    # like eval_aws does -> a prod default profile denies, else ambient ask.
+    return [ambient_aws_default_profile_decision(
+        action, seg_env, 'eksctl --cluster <name> --profile <name>',
+        'the ambient aws profile/region',
+        'the ambient aws profile/region (default profile %s)')]
 
 
 def eval_doctl(argv, seg_env, ctx):
