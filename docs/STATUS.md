@@ -24,5 +24,4 @@ Specific actionable items in priority order. Pick from the top; skip 🚫 items 
 
 | ID | Item | Labels | St | Sz | Notes |
 |---|---|---|---|---|---|
-| <a id="Q8"></a>Q8 | Read pulumi's ambient selected stack from `~/.pulumi/workspaces/` for ambient classification | `security` | 💤 | M | Today a mutating `pulumi` command with no `--stack` always asks; resolving the selected stack (keyed by a hash of the `Pulumi.yaml` path) would let ambient-prod deny. Parallel to [Q9](#Q9). |
-| <a id="Q9"></a>Q9 | Resolve a named `--profile NAME`'s account from `[profile NAME]` in `~/.aws/config` | `security` | 💤 | M | Q7 resolved only the `[default]` profile. An explicit `--profile admin` whose name classifies `unknown` still asks; reading its `sso_start_url`/`role_arn` would let it deny. Must stay additive: content escalates `unknown → deny`, never `unknown → defer`. |
+| <a id="Q8"></a>Q8 | Read pulumi's ambient selected stack from `~/.pulumi/workspaces/` for ambient classification | `security` | 💤 | M | Today a mutating `pulumi` command with no `--stack` always asks; resolving the selected stack (keyed by a hash of the `Pulumi.yaml` path) would let ambient-prod deny. |
