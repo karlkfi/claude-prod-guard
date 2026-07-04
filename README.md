@@ -94,6 +94,10 @@ across `&&`/`|`/`;`/`$( )` chains):
 | `docker push registry.prod.acme.io/app:1` | **deny** |
 | `ssh deploy@prod-web-1 uptime` | **deny** |
 | `ssh dev-box uptime` | defer |
+| `pulumi up --stack acme/prod` | **deny** |
+| `pulumi up` (no stack pinned) | **ask** |
+| `ansible-playbook -i inventories/prod site.yml` | **deny** |
+| `ansible prod-db -m ping` (read-only module) | defer |
 | `echo done && kubectl --context prod-us delete ns x` | **deny** |
 | `bash -c 'kubectl --context prod-us delete ns x'` | **deny** |
 | `kubectl delete pod x` (ambient kind context) | **ask** |
@@ -172,6 +176,8 @@ mode that matters.
 | `ssh` | destination host (`user@host`, `-J` jump host) | n/a — denylist-only: a prod destination is denied, everything else defers (see [Limitations](#limitations)) |
 | `argocd` | `--server` | `current-context` in `~/.config/argocd/config` |
 | `doctl` | `--context` | the doctl auth context (never read — always prompts) |
+| `pulumi` | `--stack` / `-s` | the selected stack (never read — always prompts); `pulumi stack select` prompts (denies for a prod stack) |
+| `ansible`, `ansible-playbook` | `-i` / `--inventory`, `--limit`, and (ad-hoc) the host pattern | `ANSIBLE_INVENTORY`, then `[defaults] inventory` in `ansible.cfg`. The inventory is the target; `--limit`/pattern can only *escalate* to a prod deny. `--syntax-check`/`--list-hosts`/`--list-tasks`/`--list-tags` and ad-hoc `-m ping`/`setup`/`debug` are read-only |
 | `kubectx` / `kubens` | n/a | switching contexts/namespaces *is* the shared-state mutation; prompts (denies for a prod context) |
 | `kustomize` | n/a | local-only tool; always defers (the `kubectl apply` it pipes into is guarded separately) |
 
@@ -259,7 +265,8 @@ ambient context. To keep work flowing:
 - **Pin the target on every mutating command**: `kubectl --context <ctx>`,
   `helm --kube-context <ctx>`, `gcloud --project <id>`,
   `aws --profile <name>`, `az --subscription <id>`,
-  `TF_WORKSPACE=<ws> terraform ...`, `docker --context <ctx>`. Relying on
+  `TF_WORKSPACE=<ws> terraform ...`, `docker --context <ctx>`,
+  `pulumi --stack <name>`, `ansible-playbook -i <inventory>`. Relying on
   the current context/config prompts every time — a parallel session can
   repoint it.
 - **Don't switch shared context** (`kubectl config use-context`, `kubectx`,
@@ -277,7 +284,7 @@ ambient context. To keep work flowing:
 
 - **False negatives are possible; treat the guard as a net, not a wall.**
   Only the listed tools are covered — a mutation through an uncovered CLI
-  (`pulumi`, `ansible`, a vendor CLI) or through a
+  (a vendor CLI, `pulumi env`, `ansible-pull`) or through a
   script/Makefile that the command merely names (`make deploy`,
   `./scripts/release.sh`) is invisible to the hook. Wrapped commands that
   resolve their own targets are usually the *safe* path — the guard exists
@@ -299,9 +306,10 @@ ambient context. To keep work flowing:
   prod host is treated as mutating: an interactive prod shell is the blast
   radius, and a read-only remote command can't be distinguished from a
   destructive one.
-- The AWS default profile and doctl auth context are not read from disk;
-  a mutating command relying on them always prompts rather than resolving
-  the ambient value.
+- The AWS default profile, doctl auth context, and pulumi's selected stack
+  are not read from disk; a mutating command relying on them always prompts
+  rather than resolving the ambient value (`pulumi stack select <prod>` is
+  still denied, so choosing a prod stack is caught).
 - Ambient state is read at *hook* time; a race remains between the hook's
   check and the command's execution. Pinning the target with a flag — which
   the ask message steers toward — is the real fix; the prompt exists to
