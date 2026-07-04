@@ -24,6 +24,6 @@ Specific actionable items in priority order. Pick from the top; skip 🚫 items 
 
 | ID | Item | Labels | St | Sz | Notes |
 |---|---|---|---|---|---|
-| <a id="Q4"></a>Q4 | Cover `pulumi`, `ansible`/`ansible-playbook`, and `ssh <prod-host>` | `coverage` | 💤 | M | Each has a different target model (stack, inventory, hostname). Hostname classification for ssh reuses the existing pattern lists. |
+| <a id="Q4"></a>Q4 | Cover `pulumi` and `ansible`/`ansible-playbook` | `coverage` | 💤 | M | Each has a different target model (stack, inventory). `ssh <prod-host>` was split off and shipped (denylist-only, like gh). |
 | <a id="Q6"></a>Q6 | Friction report: measure where prod-guard prompts accumulate from session transcripts | `infra` | 💤 | M | Port the workspace-guard `friction-report.py` approach so pattern gaps (unknown targets prompting repeatedly) are visible and fixable. |
 | <a id="Q7"></a>Q7 | Read the AWS default profile's `sso_start_url`/account from `~/.aws/config` for ambient classification | `security` | 💤 | M | Today a mutating aws command with no profile always asks; resolving the default profile would let ambient-prod deny and ambient-nonprod still ask with a better message. |
