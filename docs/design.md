@@ -61,9 +61,11 @@ The verb tables are allowlists of *known read-only* verbs, not catalogs of destr
 
 Same reasoning as the siblings: unparseable commands, uncovered tools, and read-only verbs hand control back to the normal permission flow — the user is no worse off than without the hook. Fail-open applies to *infrastructure* failures only (bad JSON, missing config file, an exception in the hook): a hook bug must never break the session. The *security* decision is where the guard fails closed.
 
-### Why `gh` gets denylist-only treatment
+### Why `gh` and `ssh` get denylist-only treatment
 
 gh's implied target — the cwd repo's `origin` remote — is pinned by the worktree, not shared clobber-prone state, so threat model 2 doesn't apply. And `gh pr create`/`gh pr merge` are the bread and butter of every Claude Code session; prompting on each would train users to disable the guard. So gh only participates in threat model 1: a mutating gh command whose resolved repo matches a prod pattern is denied.
+
+`ssh` has the same shape: its destination host is spelled out on the command line (`ssh user@host`, or a `-J` jump host), not read from clobberable ambient state, so only threat model 1 applies. Prompting on every `ssh dev-box` — the vast majority of which target unremarkable hosts that match no pattern — would be the same disable-the-guard noise, so an unknown host defers rather than asking. Unlike the other tools ssh has no read-only/mutating verb split to lean on: the "verb" is an arbitrary remote command the hook can't see, and an interactive shell has no verb at all. Since a prod shell *is* the blast radius, every ssh into a prod-classified host is treated as mutating and denied. This is purely additive coverage — ssh was previously uncovered (always deferred), so denylist-only only ever adds a deny, never removes a prompt.
 
 ## Alternatives considered and rejected
 

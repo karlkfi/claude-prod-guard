@@ -92,6 +92,8 @@ across `&&`/`|`/`;`/`$( )` chains):
 | `TF_WORKSPACE=dev terraform apply` (S3 backend bucket is `acme-prod-tfstate`) | **deny** |
 | `gcloud compute instances delete vm1 --project acme-prod` | **deny** |
 | `docker push registry.prod.acme.io/app:1` | **deny** |
+| `ssh deploy@prod-web-1 uptime` | **deny** |
+| `ssh dev-box uptime` | defer |
 | `echo done && kubectl --context prod-us delete ns x` | **deny** |
 | `bash -c 'kubectl --context prod-us delete ns x'` | **deny** |
 | `kubectl delete pod x` (ambient kind context) | **ask** |
@@ -167,6 +169,7 @@ mode that matters.
 | `terraform` / `tofu` | `TF_WORKSPACE` | `.terraform/environment` in the working dir; the initialized backend's state location (S3/GCS bucket, Terraform Cloud org/workspace) from `.terraform/terraform.tfstate` is classified too, so a prod state location denies even behind an innocuous workspace name; `apply`/`destroy` are always treated as mutating |
 | `docker`, `podman`, `nerdctl`, `docker-compose` | `--context` / `--connection`, `DOCKER_HOST` / `CONTAINER_HOST` | `currentContext` in `~/.docker/config.json`; a local-daemon context defers. `docker push` classifies the image ref's registry; `build --push` classifies **every** `-t` tag; `compose push` fails closed (the registry lives in the compose file, which the hook doesn't parse) |
 | `gh` | `-R`/`--repo`, `GH_REPO` | the cwd repo's `origin` remote (denylist-only — see [Limitations](#limitations)) |
+| `ssh` | destination host (`user@host`, `-J` jump host) | n/a — denylist-only: a prod destination is denied, everything else defers (see [Limitations](#limitations)) |
 | `argocd` | `--server` | `current-context` in `~/.config/argocd/config` |
 | `doctl` | `--context` | the doctl auth context (never read — always prompts) |
 | `kubectx` / `kubens` | n/a | switching contexts/namespaces *is* the shared-state mutation; prompts (denies for a prod context) |
@@ -274,7 +277,7 @@ ambient context. To keep work flowing:
 
 - **False negatives are possible; treat the guard as a net, not a wall.**
   Only the listed tools are covered — a mutation through an uncovered CLI
-  (`pulumi`, `ansible`, `ssh prod-host ...`, a vendor CLI) or through a
+  (`pulumi`, `ansible`, a vendor CLI) or through a
   script/Makefile that the command merely names (`make deploy`,
   `./scripts/release.sh`) is invisible to the hook. Wrapped commands that
   resolve their own targets are usually the *safe* path — the guard exists
@@ -288,10 +291,14 @@ ambient context. To keep work flowing:
   patterns to know what "prod" means in your org. Server resolution covers
   `kubectl`/`oc`/`flux`/`helm` and context switches (`kubectx`,
   `kubectl config use-context`); other tools classify by name only.
-- `gh` is denylist-only: its implied target (the cwd repo's remote) is
-  pinned by the worktree, not clobber-prone shared state, and prompting on
-  every `gh pr create` would be pure noise. A mutating `gh` command is only
-  blocked when the resolved repo matches a prod pattern.
+- `gh` and `ssh` are denylist-only: their target is pinned on the command
+  line (gh's repo remote, ssh's destination host), not clobber-prone shared
+  state, and prompting on every `gh pr create` or `ssh dev-box` would be pure
+  noise. Each is only blocked when the resolved target matches a prod pattern
+  — an unknown host or repo defers rather than prompting. Any `ssh` into a
+  prod host is treated as mutating: an interactive prod shell is the blast
+  radius, and a read-only remote command can't be distinguished from a
+  destructive one.
 - The AWS default profile and doctl auth context are not read from disk;
   a mutating command relying on them always prompts rather than resolving
   the ambient value.

@@ -803,6 +803,60 @@ class GhTests(unittest.TestCase):
         self.assertEqual(decision, "deny")
 
 
+class SshTests(unittest.TestCase):
+    def test_prod_host_denied(self):
+        decision, reason = run_hook("ssh prod-web-1")
+        self.assertEqual(decision, "deny")
+        self.assertIn("prod-web-1", reason)
+
+    def test_prod_host_with_user_denied(self):
+        decision, _ = run_hook("ssh deploy@prod-web-1 uptime")
+        self.assertEqual(decision, "deny")
+
+    def test_prod_host_with_flags_denied(self):
+        decision, _ = run_hook("ssh -p 2222 -i ~/.ssh/id deploy@prd-db")
+        self.assertEqual(decision, "deny")
+
+    def test_prod_jump_host_denied(self):
+        # The destination is innocuous but the -J bastion classifies prod.
+        decision, _ = run_hook("ssh -J jump@prod-bastion app-1")
+        self.assertEqual(decision, "deny")
+
+    def test_ssh_url_scheme_prod_denied(self):
+        decision, _ = run_hook("ssh ssh://root@prod-host:22/")
+        self.assertEqual(decision, "deny")
+
+    def test_nonprod_host_defers(self):
+        decision, _ = run_hook("ssh dev-box uptime")
+        self.assertIsNone(decision)
+
+    def test_unknown_host_defers(self):
+        # Denylist-only: an unrecognized host is not prompted (would be noise).
+        decision, _ = run_hook("ssh bastion.example.com")
+        self.assertIsNone(decision)
+
+    def test_git_over_ssh_defers(self):
+        decision, _ = run_hook("ssh -T git@github.com")
+        self.assertIsNone(decision)
+
+    def test_flag_value_not_mistaken_for_host(self):
+        # -o's value must not be read as the destination.
+        decision, _ = run_hook("ssh -o StrictHostKeyChecking=no dev-box")
+        self.assertIsNone(decision)
+
+    def test_version_flag_defers(self):
+        decision, _ = run_hook("ssh -V")
+        self.assertIsNone(decision)
+
+    def test_prod_host_in_pipe_denied(self):
+        decision, _ = run_hook("tar cf - . | ssh prod-web-1 'tar xf -'")
+        self.assertEqual(decision, "deny")
+
+    def test_override_downgrades_ssh_deny(self):
+        decision, _ = run_hook("PROD_GUARD_OVERRIDE=incident-9 ssh prod-web-1")
+        self.assertEqual(decision, "ask")
+
+
 class ContextSwitcherTests(unittest.TestCase):
     def test_kubectx_prod_denied(self):
         decision, _ = run_hook("kubectx gke_acme_prod-us")

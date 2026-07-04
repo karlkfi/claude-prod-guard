@@ -1298,6 +1298,69 @@ def eval_gh(argv, seg_env, ctx):
     return []
 
 
+# ssh flags that consume the following token as their value, so it is never
+# mistaken for the destination host. Boolean flags (-v, -N, -t, -4, ...) take
+# no value and are simply skipped. All are single-dash (ssh has no --long form).
+SSH_VALUE_FLAGS = frozenset({
+    '-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m',
+    '-O', '-o', '-p', '-Q', '-R', '-S', '-W', '-w',
+})
+
+
+def _ssh_host(dest):
+    """Bare hostname from an ssh destination: strip a `ssh://` scheme and any
+    path, a `user@` prefix, and a trailing `:port`. Bracketed IPv6 literals
+    (`[::1]:22`) keep their brackets so they still match the loopback pattern;
+    an unbracketed IPv6 literal is left whole (it has several colons, so the
+    port strip below leaves it untouched)."""
+    if not dest:
+        return None
+    d = dest
+    if d.startswith('ssh://'):
+        d = d[len('ssh://'):].split('/', 1)[0]
+    if '@' in d:
+        d = d.rsplit('@', 1)[1]
+    if d.startswith('['):
+        end = d.find(']')
+        if end != -1:
+            d = d[:end + 1]  # [::1]:22 -> [::1]
+    elif d.count(':') == 1:
+        d = d.split(':', 1)[0]  # host:port -> host
+    return d or None
+
+
+def eval_ssh(argv, seg_env, ctx):
+    """ssh gets denylist-only treatment like gh: the destination host is
+    pinned on the command line, not clobber-prone ambient state, so only the
+    prod-blast-radius model applies. Any ssh into a prod host is treated as
+    mutating — an interactive prod shell is the blast radius, and a read-only
+    remote command can't be told from a destructive one — so a prod
+    destination (or `-J` jump host) is denied and everything else defers."""
+    hosts = []
+    dest = None
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok in SSH_VALUE_FLAGS:
+            if tok == '-J' and i + 1 < len(argv):
+                # `-J [user@]host[:port][,...]` — each hop is a host we transit.
+                hosts += [_ssh_host(p) for p in argv[i + 1].split(',')]
+            i += 2
+            continue
+        if tok.startswith('-'):
+            i += 1
+            continue
+        dest = tok  # first bare operand is the destination; the rest is the
+        break       # remote command, whose flags must not be reparsed as ssh's
+    if dest is not None:
+        hosts.append(_ssh_host(dest))
+    action = 'ssh %s' % dest if dest else 'ssh'
+    for h in hosts:
+        if h and classify(h) == 'prod':
+            return [deny_prod(action, "host '%s'" % h)]
+    return []
+
+
 def eval_argocd(argv, seg_env, ctx):
     words = words_of(argv, ('--server', '--grpc-web-root-path', '--project'))
     action = action_of(argv, words)
@@ -1399,6 +1462,7 @@ EVALUATORS = {
     'nerdctl': eval_docker,
     'docker-compose': eval_docker,  # standalone compose v1 binary
     'gh': eval_gh,
+    'ssh': eval_ssh,
     'argocd': eval_argocd,
     'eksctl': eval_eksctl,
     'doctl': eval_doctl,
