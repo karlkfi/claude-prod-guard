@@ -1009,6 +1009,35 @@ class EksctlDoctlTests(unittest.TestCase):
         decision, _ = run_hook("eksctl get cluster")
         self.assertIsNone(decision)
 
+    def test_eksctl_ambient_default_profile_prod_denied(self):
+        # Q10: unpinned mutating eksctl resolves the ~/.aws/config [default]
+        # profile like eval_aws -> a prod default profile denies.
+        home = make_home(aws_config=(
+            "[default]\n"
+            "sso_start_url = https://acme-prod.awsapps.com/start\n"))
+        decision, reason = run_hook("eksctl delete cluster", home=home)
+        self.assertEqual(decision, "deny")
+        self.assertIn("acme-prod", reason)
+
+    def test_eksctl_ambient_default_profile_dev_still_asks(self):
+        home = make_home(aws_config=(
+            "[default]\nsso_start_url = https://acme-dev.awsapps.com/start\n"))
+        decision, reason = run_hook("eksctl delete cluster", home=home)
+        self.assertEqual(decision, "ask")
+        self.assertIn("acme-dev", reason)
+
+    def test_eksctl_ambient_no_config_asks(self):
+        # No ~/.aws/config -> nothing to resolve -> generic ambient ask.
+        decision, reason = run_hook("eksctl delete cluster")
+        self.assertEqual(decision, "ask")
+        self.assertIn("--profile", reason)
+
+    def test_eksctl_default_profile_env_prod_denied(self):
+        # AWS_DEFAULT_PROFILE is treated as an explicit pin (parity with aws).
+        decision, _ = run_hook(
+            "AWS_DEFAULT_PROFILE=prod-admin eksctl delete cluster")
+        self.assertEqual(decision, "deny")
+
     def test_doctl_delete_no_context_asks(self):
         decision, _ = run_hook("doctl kubernetes cluster delete c1")
         self.assertEqual(decision, "ask")
