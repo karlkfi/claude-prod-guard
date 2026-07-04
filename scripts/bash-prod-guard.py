@@ -754,8 +754,9 @@ def eval_flux(argv, seg_env, ctx):
 
 
 def eval_kubectx(argv, seg_env, ctx):
-    args = [a for a in argv[1:] if not a.startswith('-')]
-    flags = [a for a in argv[1:] if a.startswith('-')]
+    # A lone `-` is the "previous context" operand, not a flag.
+    args = [a for a in argv[1:] if a == '-' or not a.startswith('-')]
+    flags = [a for a in argv[1:] if a != '-' and a.startswith('-')]
     if '-d' in flags:
         return [ask_switch('kubectx -d', 'the shared kubeconfig')]
     if not args or '-c' in flags or '--current' in flags:
