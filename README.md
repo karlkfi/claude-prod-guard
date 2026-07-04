@@ -157,13 +157,13 @@ mode that matters.
 
 | Tool | Explicit target | Ambient fallback |
 | --- | --- | --- |
-| `kubectl`, `flux` | `--context` | `current-context` in `$KUBECONFIG` / `~/.kube/config` |
+| `kubectl`, `oc`, `flux` | `--context` | `current-context` in `$KUBECONFIG` / `~/.kube/config`; `oc login` / `oc project` prompt as kubeconfig writers |
 | `helm` | `--kube-context` | same kubeconfig `current-context` |
 | `gcloud` | `--project` / `--zone` / `--region` / `--account`, `CLOUDSDK_CORE_PROJECT` | project of the active gcloud configuration |
 | `aws`, `eksctl` | `--profile` / `--region`, `AWS_PROFILE` | the default profile (never read — always prompts) |
 | `az` | `--subscription` | default subscription in `~/.azure/azureProfile.json` |
 | `terraform` / `tofu` | `TF_WORKSPACE` | `.terraform/environment` in the working dir; `apply`/`destroy` are always treated as mutating |
-| `docker` | `--context`, `DOCKER_HOST` | `currentContext` in `~/.docker/config.json`; a local-daemon context defers. `docker push` classifies the image ref's registry |
+| `docker`, `podman`, `nerdctl`, `docker-compose` | `--context` / `--connection`, `DOCKER_HOST` / `CONTAINER_HOST` | `currentContext` in `~/.docker/config.json`; a local-daemon context defers. `docker push` classifies the image ref's registry; `build --push` classifies **every** `-t` tag; `compose push` fails closed (the registry lives in the compose file, which the hook doesn't parse) |
 | `gh` | `-R`/`--repo`, `GH_REPO` | the cwd repo's `origin` remote (denylist-only — see [Limitations](#limitations)) |
 | `argocd` | `--server` | `current-context` in `~/.config/argocd/config` |
 | `doctl` | `--context` | the doctl auth context (never read — always prompts) |
