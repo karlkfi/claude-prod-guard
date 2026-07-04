@@ -585,6 +585,29 @@ class AwsDefaultProfileTests(unittest.TestCase):
         self.assertIsNone(
             guard.aws_default_profile({"AWS_CONFIG_FILE": "/no/such/aws/config"}))
 
+    def test_named_profile_section(self):
+        # A named profile lives under [profile NAME], not [NAME].
+        d = tempfile.mkdtemp(prefix="prod-guard-aws-")
+        path = os.path.join(d, "config")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[profile admin]\n"
+                    "sso_start_url = https://acme-prod.awsapps.com/start\n")
+        named, _ = guard.aws_profile_fields("admin", {"AWS_CONFIG_FILE": path})
+        self.assertEqual(named[0], "https://acme-prod.awsapps.com/start")
+        # The bare [admin] form (credentials-file style) is not read from config.
+        self.assertIsNone(
+            guard.aws_profile_fields("missing", {"AWS_CONFIG_FILE": path}))
+
+    def test_named_profile_follows_sso_session(self):
+        d = tempfile.mkdtemp(prefix="prod-guard-aws-")
+        path = os.path.join(d, "config")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[profile ops]\nsso_session = corp\n"
+                    "[sso-session corp]\n"
+                    "sso_start_url = https://x-prod.awsapps.com/start\n")
+        named, _ = guard.aws_profile_fields("ops", {"AWS_CONFIG_FILE": path})
+        self.assertIn("https://x-prod.awsapps.com/start", named)
+
 
 class AwsAzTests(unittest.TestCase):
     def test_terminate_prod_profile_denied(self):
@@ -679,6 +702,71 @@ class AwsAzTests(unittest.TestCase):
         decision, _ = run_hook(
             "aws s3 rm s3://bucket/key --profile dev", home=home)
         self.assertIsNone(decision)
+
+    def test_named_profile_sso_prod_denied(self):
+        # Q9: an unknown-named --profile whose [profile NAME] account is prod
+        # escalates from ask to deny, echoing the resolved identifier.
+        home = make_home(aws_config=(
+            "[profile admin]\n"
+            "sso_start_url = https://acme-prod.awsapps.com/start\n"))
+        decision, reason = run_hook(
+            "aws ec2 terminate-instances --instance-ids i-1 --profile admin",
+            home=home)
+        self.assertEqual(decision, "deny")
+        self.assertIn("acme-prod", reason)
+        self.assertIn("admin", reason)
+
+    def test_named_profile_role_arn_prod_denied(self):
+        home = make_home(aws_config=(
+            "[profile ops]\nrole_arn = arn:aws:iam::123456789012:role/prod-admin\n"))
+        decision, _ = run_hook("aws s3 rm s3://bucket/key --profile ops", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_named_profile_via_env_prod_denied(self):
+        # AWS_PROFILE names the profile just like --profile does.
+        home = make_home(aws_config=(
+            "[profile admin]\n"
+            "sso_start_url = https://acme-prod.awsapps.com/start\n"))
+        decision, _ = run_hook(
+            "AWS_PROFILE=admin aws s3 rm s3://bucket/key", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_named_profile_credential_process_prod_denied_no_echo(self):
+        home = make_home(aws_config=(
+            "[profile admin]\ncredential_process = /opt/prod-creds/get.sh\n"))
+        decision, reason = run_hook(
+            "aws s3 rm s3://bucket/key --profile admin", home=home)
+        self.assertEqual(decision, "deny")
+        self.assertNotIn("prod-creds", reason)
+
+    def test_named_profile_follows_sso_session_ref(self):
+        home = make_home(aws_config=(
+            "[profile admin]\nsso_session = corp\n"
+            "\n[sso-session corp]\n"
+            "sso_start_url = https://acme-production.awsapps.com/start\n"))
+        decision, _ = run_hook(
+            "aws s3 rm s3://bucket/key --profile admin", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_nonprod_named_profile_defers_despite_prod_field(self):
+        # The explicit nonprod NAME wins: content resolution is scoped to the
+        # unknown-name case, so a shared prod sso_start_url can't flip a
+        # user-named dev profile to deny.
+        home = make_home(aws_config=(
+            "[profile dev]\n"
+            "sso_start_url = https://acme-prod.awsapps.com/start\n"))
+        decision, _ = run_hook(
+            "aws s3 rm s3://bucket/key --profile dev", home=home)
+        self.assertIsNone(decision)
+
+    def test_unknown_named_profile_no_section_asks(self):
+        # No [profile admin] section -> resolves nothing -> unchanged by-name ask.
+        home = make_home(aws_config=(
+            "[default]\nsso_start_url = https://acme-dev.awsapps.com/start\n"))
+        decision, reason = run_hook(
+            "aws s3 rm s3://bucket/key --profile admin", home=home)
+        self.assertEqual(decision, "ask")
+        self.assertIn("admin", reason)
 
     def test_default_profile_malformed_config_asks(self):
         # Garbage config resolves nothing -> generic ambient ask (fail-open).

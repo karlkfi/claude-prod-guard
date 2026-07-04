@@ -612,18 +612,21 @@ def _parse_ini_sections(path):
     return sections
 
 
-def aws_default_profile(seg_env):
-    """(named, extra) classifiable strings from the `[default]` profile in
+def aws_profile_fields(name, seg_env):
+    """(named, extra) classifiable strings from a profile section in
     ~/.aws/config (or $AWS_CONFIG_FILE), following an `sso_session` reference
     into its `[sso-session NAME]` block.
+
+    The section is `[default]` when name == 'default', else `[profile NAME]`
+    (the AWS config convention: only the default profile is bare).
 
     - named = echoable identifiers (sso_start_url/role_arn/...), in display
       preference order so named[0] is the most identifying present field.
     - extra = every other key's value (classify-only, never echoed — a
       credential_process command may live here).
 
-    None when the file or the `[default]` section is missing/unreadable, i.e.
-    there is no ambient default profile to resolve (fail OPEN -> generic ask)."""
+    None when the file or the profile's section is missing/unreadable, i.e.
+    there is no profile to resolve (fail OPEN -> caller's generic ask)."""
     path = seg_env.get('AWS_CONFIG_FILE') or os.environ.get('AWS_CONFIG_FILE')
     if not path:
         home = os.environ.get('HOME')
@@ -631,7 +634,8 @@ def aws_default_profile(seg_env):
             return None
         path = os.path.join(home, '.aws', 'config')
     sections = _parse_ini_sections(path)
-    profile = sections.get('default')
+    section = 'default' if name == 'default' else 'profile ' + name
+    profile = sections.get(section)
     if profile is None:
         return None
     merged = dict(profile)
@@ -642,6 +646,33 @@ def aws_default_profile(seg_env):
     extra = [v for k, v in merged.items()
              if k not in _AWS_ECHOABLE_KEYS and v]
     return named, extra
+
+
+def aws_default_profile(seg_env):
+    """(named, extra) for the ambient `[default]` profile — see
+    aws_profile_fields. None when there is no default profile to resolve."""
+    return aws_profile_fields('default', seg_env)
+
+
+def aws_named_profile_prod(name, seg_env):
+    """Deny description if an explicit `--profile NAME`'s `[profile NAME]`
+    section resolves a prod account (a prod sso_start_url/role_arn/... echoes
+    that field; a prod value in any other key denies without echo), else None.
+
+    Additive over name-only classification: only a prod signal turns the
+    explicit-profile ask into a deny; a nonprod/unknown/unresolvable profile
+    resolves nothing here and the caller keeps its by-name verdict."""
+    resolved = aws_profile_fields(name, seg_env)
+    if resolved is None:
+        return None
+    named, extra = resolved
+    for v in named:
+        if classify(v) == 'prod':
+            return "aws profile '%s' (%s)" % (name, v)
+    for v in extra:
+        if classify(v) == 'prod':
+            return "aws profile '%s'" % name
+    return None
 
 
 def git_remote_url(cwd):
@@ -1169,6 +1200,13 @@ def eval_aws(argv, seg_env, ctx):
             return [deny_prod(action, desc)]
         if cls == 'nonprod':
             return []
+        # Name (and region) told us nothing. Resolve where `[profile NAME]`
+        # in ~/.aws/config actually reaches — a prod sso_start_url/role_arn/...
+        # denies. Additive: this only escalates unknown -> deny; a
+        # nonprod/unknown/unresolvable profile keeps the by-name ask below.
+        named_prod = aws_named_profile_prod(profile, seg_env)
+        if named_prod:
+            return [deny_prod(action, named_prod)]
         return [ask_unknown(action, desc)]
     # No explicit profile pinned: the target is the `[default]` profile, whose
     # sso_start_url / role_arn / sso_session in ~/.aws/config name the account

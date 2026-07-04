@@ -106,6 +106,7 @@ across `&&`/`|`/`;`/`$( )` chains):
 | `terraform apply` (no workspace pinned) | **ask** |
 | `aws s3 rm s3://bucket/key` (no profile pinned) | **ask** |
 | `aws ec2 terminate-instances …` (default profile → prod SSO account) | **deny** |
+| `aws s3 rm … --profile admin` (`[profile admin]` → prod SSO account) | **deny** |
 | `kubectl config use-context kind-ci` | **ask** |
 | `kubectx prod-us` | **deny** |
 | `PROD_GUARD_OVERRIDE=incident-42 kubectl --context prod-us delete ns x` | **ask** |
@@ -170,7 +171,7 @@ mode that matters.
 | `kubectl`, `oc`, `flux` | `--context` | `current-context` in `$KUBECONFIG` / `~/.kube/config`; `oc login` / `oc project` prompt as kubeconfig writers. A context resolves to its cluster's `server:` URL in the kubeconfig, which is classified alongside the context name — so a prod cluster reached through an innocuously named context is still denied |
 | `helm` | `--kube-context` | same kubeconfig `current-context` |
 | `gcloud` | `--project` / `--zone` / `--region` / `--account`, `CLOUDSDK_CORE_PROJECT` | project of the active gcloud configuration |
-| `aws` | `--profile` / `--region`, `AWS_PROFILE` | the `[default]` profile's `sso_start_url` / `role_arn` / `sso_session` in `~/.aws/config` (or `$AWS_CONFIG_FILE`) — a prod account denies, otherwise prompts |
+| `aws` | `--profile` / `--region`, `AWS_PROFILE`. An unknown-named profile is resolved to its `[profile NAME]` account (`sso_start_url` / `role_arn` / `sso_session`) in `~/.aws/config`, so a prod account behind an innocuous name still denies | the `[default]` profile's `sso_start_url` / `role_arn` / `sso_session` in `~/.aws/config` (or `$AWS_CONFIG_FILE`) — a prod account denies, otherwise prompts |
 | `eksctl` | `--profile` / `--region`, `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | the `[default]` profile in `~/.aws/config`, resolved exactly as for `aws` — a prod account denies, otherwise prompts |
 | `az` | `--subscription` | default subscription in `~/.azure/azureProfile.json` |
 | `terraform` / `tofu` | `TF_WORKSPACE` | `.terraform/environment` in the working dir; the initialized backend's state location (S3/GCS bucket, Terraform Cloud org/workspace) from `.terraform/terraform.tfstate` is classified too, so a prod state location denies even behind an innocuous workspace name; `apply`/`destroy` are always treated as mutating |
