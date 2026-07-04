@@ -637,6 +637,94 @@ class TerraformTests(unittest.TestCase):
         decision, _ = run_hook("terraform state list")
         self.assertIsNone(decision)
 
+    @staticmethod
+    def _backend_home(config, btype="s3"):
+        """A fixture $HOME whose cwd holds a .terraform/terraform.tfstate
+        naming the given backend type and config."""
+        home = make_home()
+        tfdir = os.path.join(home, ".terraform")
+        os.makedirs(tfdir)
+        with open(os.path.join(tfdir, "terraform.tfstate"),
+                  "w", encoding="utf-8") as f:
+            json.dump({"version": 3,
+                       "backend": {"type": btype, "config": config}}, f)
+        return home
+
+    def test_prod_backend_denies_despite_dev_workspace(self):
+        # The weak-proxy catch: workspace says dev, the S3 bucket says prod.
+        home = self._backend_home({"bucket": "acme-prod-tfstate",
+                                    "key": "svc/terraform.tfstate"})
+        decision, reason = run_hook("TF_WORKSPACE=dev terraform apply",
+                                    home=home, cwd=home)
+        self.assertEqual(decision, "deny")
+        self.assertIn("acme-prod-tfstate", reason)
+
+    def test_prod_backend_denies_ambient(self):
+        home = self._backend_home({"bucket": "acme-prod-tfstate"})
+        decision, _ = run_hook("terraform apply", home=home, cwd=home)
+        self.assertEqual(decision, "deny")
+
+    def test_prod_backend_key_path_denies(self):
+        # Nonprod bucket, but the state key path is clearly prod.
+        home = self._backend_home({"bucket": "shared-tfstate",
+                                   "key": "env/prod/main.tfstate"})
+        decision, _ = run_hook("terraform destroy", home=home, cwd=home)
+        self.assertEqual(decision, "deny")
+
+    def test_prod_gcs_backend_denies(self):
+        home = self._backend_home({"bucket": "acme-prod-tfstate",
+                                   "prefix": "svc"}, btype="gcs")
+        decision, _ = run_hook("terraform apply", home=home, cwd=home)
+        self.assertEqual(decision, "deny")
+
+    def test_prod_tfc_workspace_denies(self):
+        home = self._backend_home(
+            {"organization": "acme",
+             "workspaces": {"name": "networking-prod"}}, btype="remote")
+        decision, _ = run_hook("terraform apply", home=home, cwd=home)
+        self.assertEqual(decision, "deny")
+
+    def test_unknown_backend_type_denies_without_echoing_value(self):
+        home = self._backend_home({"conn_str": "host=prod-db.acme"},
+                                  btype="pg")
+        decision, reason = run_hook("terraform apply", home=home, cwd=home)
+        self.assertEqual(decision, "deny")
+        # Unknown types report the type only — never the raw (possibly
+        # credential-bearing) value.
+        self.assertNotIn("prod-db.acme", reason)
+        self.assertIn("pg", reason)
+
+    def test_nonprod_backend_still_defers_with_dev_workspace(self):
+        home = self._backend_home({"bucket": "acme-dev-tfstate"})
+        decision, _ = run_hook("TF_WORKSPACE=dev terraform apply",
+                               home=home, cwd=home)
+        self.assertIsNone(decision)
+
+    def test_local_backend_unchanged(self):
+        # A local backend has no remote target; behavior falls back to the
+        # workspace-only path (no workspace pinned -> ask).
+        home = self._backend_home({"path": "prod.tfstate"}, btype="local")
+        decision, _ = run_hook("terraform apply", home=home, cwd=home)
+        self.assertEqual(decision, "ask")
+
+    def test_prod_workspace_wins_over_nonprod_backend(self):
+        home = self._backend_home({"bucket": "acme-dev-tfstate"})
+        decision, _ = run_hook("TF_WORKSPACE=prod terraform apply",
+                               home=home, cwd=home)
+        self.assertEqual(decision, "deny")
+
+    def test_malformed_backend_state_fails_open(self):
+        # Unparseable .terraform/terraform.tfstate -> resolve nothing ->
+        # unchanged workspace-only behavior (fail OPEN on the infra read).
+        home = make_home()
+        tfdir = os.path.join(home, ".terraform")
+        os.makedirs(tfdir)
+        with open(os.path.join(tfdir, "terraform.tfstate"),
+                  "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        decision, _ = run_hook("terraform apply", home=home, cwd=home)
+        self.assertEqual(decision, "ask")
+
 
 class DockerTests(unittest.TestCase):
     def test_local_daemon_mutation_defers(self):
