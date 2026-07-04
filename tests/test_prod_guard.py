@@ -1032,6 +1032,123 @@ class SpecialCaseTests(unittest.TestCase):
         self.assertIsNone(decision)
 
 
+class AliasToolTests(unittest.TestCase):
+    """Q1: oc shares kubectl's evaluator; podman/nerdctl/docker-compose share
+    docker's. The alias must inherit the full decision matrix, plus the few
+    alias-specific verbs (oc login/project, podman --connection)."""
+
+    def test_oc_prod_mutation_denied(self):
+        decision, _ = run_hook("oc --context gke_acme_prod-us delete project x")
+        self.assertEqual(decision, "deny")
+
+    def test_oc_readonly_defers(self):
+        for cmd in ("oc --context gke_acme_prod-us get pods",
+                    "oc status", "oc whoami", "oc projects",
+                    "oc process -f template.yaml"):
+            with self.subTest(cmd=cmd):
+                decision, _ = run_hook(cmd)
+                self.assertIsNone(decision)
+
+    def test_oc_ambient_mutation_asks(self):
+        home = make_home(kubeconfig=KUBECONFIG_KIND)
+        decision, _ = run_hook("oc new-app nginx", home=home)
+        self.assertEqual(decision, "ask")
+
+    def test_oc_login_asks(self):
+        decision, reason = run_hook("oc login https://api.cluster.example:6443")
+        self.assertEqual(decision, "ask")
+        self.assertIn("kubeconfig", reason)
+
+    def test_oc_project_switch_asks_bare_defers(self):
+        decision, _ = run_hook("oc project other-ns")
+        self.assertEqual(decision, "ask")
+        decision, _ = run_hook("oc project")
+        self.assertIsNone(decision)
+
+    def test_kubectl_login_verb_stays_guarded(self):
+        # kubectl has no `login`; via oc's rule it now asks rather than
+        # falling into ambient resolution — still never a silent pass.
+        decision, _ = run_hook("kubectl login")
+        self.assertEqual(decision, "ask")
+
+    def test_podman_local_defers_remote_denied(self):
+        decision, _ = run_hook("podman rm -f c1")
+        self.assertIsNone(decision)
+        decision, _ = run_hook("podman --connection prod-host rm -f c1")
+        self.assertEqual(decision, "deny")
+
+    def test_podman_container_host_env_denied(self):
+        decision, _ = run_hook(
+            "CONTAINER_HOST=ssh://root@prod-host podman rm -f c1")
+        self.assertEqual(decision, "deny")
+
+    def test_podman_push_prod_registry_denied(self):
+        decision, _ = run_hook("podman push registry.prod.acme.io/app:1")
+        self.assertEqual(decision, "deny")
+
+    def test_nerdctl_push_and_local(self):
+        decision, _ = run_hook("nerdctl rm -f c1")
+        self.assertIsNone(decision)
+        decision, _ = run_hook("nerdctl push registry.prod.acme.io/app:1")
+        self.assertEqual(decision, "deny")
+
+
+class DockerComposeAndMultiTagTests(unittest.TestCase):
+    """Q5: every -t on docker build --push is classified, and compose pushes
+    (whose registry lives in the compose file) fail closed."""
+
+    def test_multi_tag_push_prod_second_denied(self):
+        decision, _ = run_hook(
+            "docker build --push -t 127.0.0.1:5000/app:1 "
+            "-t registry.prod.acme.io/app:1 .")
+        self.assertEqual(decision, "deny")
+
+    def test_multi_tag_push_all_nonprod_defers(self):
+        decision, _ = run_hook(
+            "docker build --push -t 127.0.0.1:5000/app:1 -t kind-local/app:1 .")
+        self.assertIsNone(decision)
+
+    def test_multi_tag_push_unknown_among_nonprod_asks(self):
+        decision, reason = run_hook(
+            "docker build --push -t 127.0.0.1:5000/app:1 -t ghcr.io/acme/app:1 .")
+        self.assertEqual(decision, "ask")
+        self.assertIn("ghcr.io/acme/app:1", reason)
+
+    def test_push_without_tags_asks(self):
+        decision, _ = run_hook("docker buildx build --push .")
+        self.assertEqual(decision, "ask")
+
+    def test_compose_push_asks(self):
+        decision, reason = run_hook("docker compose push")
+        self.assertEqual(decision, "ask")
+        self.assertIn("compose file", reason)
+
+    def test_compose_build_push_asks_plain_build_defers(self):
+        decision, _ = run_hook("docker compose build --push")
+        self.assertEqual(decision, "ask")
+        decision, _ = run_hook("docker compose build")
+        self.assertIsNone(decision)
+
+    def test_compose_readonly_defers(self):
+        for tail in ("ps", "config", "logs", "ls"):
+            with self.subTest(tail=tail):
+                decision, _ = run_hook("docker compose %s" % tail)
+                self.assertIsNone(decision)
+
+    def test_compose_up_local_defers_prod_context_denied(self):
+        decision, _ = run_hook("docker compose up -d")
+        self.assertIsNone(decision)
+        home = make_home(docker_context="prod-swarm")
+        decision, _ = run_hook("docker compose up -d", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_standalone_docker_compose_binary(self):
+        decision, _ = run_hook("docker-compose push")
+        self.assertEqual(decision, "ask")
+        decision, _ = run_hook("docker-compose ps")
+        self.assertIsNone(decision)
+
+
 class RobustnessTests(unittest.TestCase):
     """The hook must never crash (PROD_GUARD_DEBUG=1 in run_hook re-raises
     any exception as a nonzero exit) and never emit `allow` (asserted inside

@@ -326,6 +326,26 @@ def first_flag_value(argv, names):
     return None
 
 
+def all_flag_values(argv, names):
+    """Every value of the given flags, in order — for repeatable flags like
+    docker's `-t` (flag_values keeps only the last occurrence per flag)."""
+    out = []
+    nameset = set(names)
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in nameset and i + 1 < len(argv):
+            out.append(argv[i + 1])
+            i += 2
+            continue
+        if '=' in tok:
+            head, _, val = tok.partition('=')
+            if head in nameset:
+                out.append(val)
+        i += 1
+    return out
+
+
 def words_of(argv, value_flags=()):
     """Non-flag tokens of a simple command, with the values of known
     value-taking flags removed so `-n foo` doesn't surface `foo` as a verb.
@@ -557,6 +577,8 @@ KUBECTL_READONLY = frozenset({
     'get', 'describe', 'logs', 'top', 'explain', 'api-resources',
     'api-versions', 'version', 'cluster-info', 'diff', 'events', 'wait',
     'auth', 'completion', 'options', 'kustomize',
+    # oc (OpenShift) shares this evaluator; its read-only extras:
+    'status', 'whoami', 'projects', 'process',
 })
 KUBECTL_CONFIG_READONLY = frozenset({
     'view', 'get-contexts', 'get-clusters', 'get-users', 'current-context',
@@ -715,6 +737,16 @@ def eval_kubectl(argv, seg_env, ctx):
         return []
     if verb == 'rollout' and len(words) > 1 and words[1] in ('status', 'history'):
         return []
+    # oc (OpenShift) shares this evaluator; its extra shared-state verbs:
+    if verb == 'login':
+        # `oc login <server>` writes credentials and a context into the
+        # shared kubeconfig (kubectl has no such verb, so no collision).
+        return [ask_switch(action, 'the shared kubeconfig (login writes a new context)')]
+    if verb == 'project':
+        name = words[1] if len(words) > 1 else None
+        if name is None:
+            return []  # bare `oc project` only prints the current project
+        return [ask_switch(action, 'the shared kubeconfig (current project of the context)')]
     explicit, edesc, ambient, adesc = _kube_target(argv, seg_env, ('--context',))
     f = policy(action, explicit, edesc, ambient, adesc, 'kubectl --context <ctx>')
     return [f] if f else []
@@ -938,7 +970,11 @@ DOCKER_LOCAL_CONTEXTS = frozenset({
 
 
 def eval_docker(argv, seg_env, ctx):
-    words = words_of(argv, ('--context', '-H', '--host'))
+    words = words_of(argv, ('--context', '-H', '--host', '--connection'))
+    # The standalone docker-compose binary is `docker compose` without the
+    # `docker` prefix; normalize so both spell the same word sequence.
+    if os.path.basename(argv[0]) == 'docker-compose':
+        words = ['compose'] + words
     action = action_of(argv, words)
     verb = words[0].lower() if words else None
     if verb is None:
@@ -959,15 +995,36 @@ def eval_docker(argv, seg_env, ctx):
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "image ref '%s'" % (ref or '<unresolved>'))]
-    if verb in ('build', 'buildx', 'bake', 'compose'):
+    if verb == 'compose':
+        sub = words[1] if len(words) > 1 else None
+        if sub in ('config', 'ps', 'ls', 'logs', 'images', 'version',
+                   'events', 'top', 'port'):
+            return []
+        if sub == 'push' or (sub == 'build' and '--push' in argv):
+            # The registry lives in the compose file's image: keys, which the
+            # hook does not parse — unresolvable target, so fail closed.
+            return [ask_unknown(action,
+                                'images defined in the compose file '
+                                '(registry unresolvable at hook time)')]
+        if sub == 'build':
+            return []  # local build
+        # up/down/rm/stop/kill/exec/run/...: daemon mutations — fall through
+        # to the context resolution below.
+    elif verb in ('build', 'buildx', 'bake'):
         if '--push' in argv:
-            tag = first_flag_value(argv, ('-t', '--tag'))
-            cls = classify(tag)
-            if cls == 'prod':
-                return [deny_prod(action, "image tag '%s'" % tag)]
-            if cls == 'nonprod':
+            # Classify EVERY -t/--tag: one prod tag among several must deny
+            # even when the first tag is a dev registry.
+            tags = all_flag_values(argv, ('-t', '--tag'))
+            classes = [classify(t) for t in tags]
+            if 'prod' in classes:
+                bad = tags[classes.index('prod')]
+                return [deny_prod(action, "image tag '%s'" % bad)]
+            if tags and all(c == 'nonprod' for c in classes):
                 return []
-            return [ask_unknown(action, "pushed image tag '%s'" % (tag or '<unresolved>'))]
+            unknowns = [t for t, c in zip(tags, classes) if c == 'unknown']
+            return [ask_unknown(action, "pushed image tag(s) %s" %
+                                (', '.join("'%s'" % t for t in unknowns)
+                                 or '<unresolved>'))]
         return []  # local build
     if verb in DOCKER_READONLY:
         return []
@@ -975,8 +1032,11 @@ def eval_docker(argv, seg_env, ctx):
             len(words) > 1 and words[1] in ('ls', 'list', 'inspect', 'df', 'events', 'logs'):
         return []
     # Mutating daemon verb (rm/rmi/prune/run/exec/stop/kill/...): where?
-    explicit = first_flag_value(argv, ('--context',)) \
-        or seg_env.get('DOCKER_HOST') or os.environ.get('DOCKER_HOST')
+    # `--connection` is podman's remote-target flag (shares this evaluator);
+    # docker has no such flag, so including it is inert there.
+    explicit = first_flag_value(argv, ('--context', '--connection')) \
+        or seg_env.get('DOCKER_HOST') or os.environ.get('DOCKER_HOST') \
+        or seg_env.get('CONTAINER_HOST') or os.environ.get('CONTAINER_HOST')
     if explicit:
         cls = classify(explicit)
         if cls == 'prod':
@@ -1118,6 +1178,7 @@ def eval_kustomize(argv, seg_env, ctx):
 
 EVALUATORS = {
     'kubectl': eval_kubectl,
+    'oc': eval_kubectl,            # OpenShift CLI: kubectl's verb/flag model
     'helm': eval_helm,
     'flux': eval_flux,
     'kubectx': eval_kubectx,
@@ -1128,6 +1189,9 @@ EVALUATORS = {
     'terraform': eval_terraform,
     'tofu': eval_terraform,
     'docker': eval_docker,
+    'podman': eval_docker,         # daemonless but shares docker's CLI shape
+    'nerdctl': eval_docker,
+    'docker-compose': eval_docker,  # standalone compose v1 binary
     'gh': eval_gh,
     'argocd': eval_argocd,
     'eksctl': eval_eksctl,
