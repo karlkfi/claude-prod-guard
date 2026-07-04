@@ -86,6 +86,7 @@ across `&&`/`|`/`;`/`$( )` chains):
 | `gcloud compute instances list --project acme-prod` | defer |
 | `docker rm -f app` (local daemon) | defer |
 | `kubectl --context prod-us delete ns x` | **deny** |
+| `kubectl --context blue-2 delete ns x` (cluster server is `api.prod…`) | **deny** |
 | `kubectl scale deploy x --replicas=0` (current-context is prod) | **deny** |
 | `TF_WORKSPACE=prod terraform apply` | **deny** |
 | `gcloud compute instances delete vm1 --project acme-prod` | **deny** |
@@ -157,7 +158,7 @@ mode that matters.
 
 | Tool | Explicit target | Ambient fallback |
 | --- | --- | --- |
-| `kubectl`, `oc`, `flux` | `--context` | `current-context` in `$KUBECONFIG` / `~/.kube/config`; `oc login` / `oc project` prompt as kubeconfig writers |
+| `kubectl`, `oc`, `flux` | `--context` | `current-context` in `$KUBECONFIG` / `~/.kube/config`; `oc login` / `oc project` prompt as kubeconfig writers. A context resolves to its cluster's `server:` URL in the kubeconfig, which is classified alongside the context name — so a prod cluster reached through an innocuously named context is still denied |
 | `helm` | `--kube-context` | same kubeconfig `current-context` |
 | `gcloud` | `--project` / `--zone` / `--region` / `--account`, `CLOUDSDK_CORE_PROJECT` | project of the active gcloud configuration |
 | `aws`, `eksctl` | `--profile` / `--region`, `AWS_PROFILE` | the default profile (never read — always prompts) |
@@ -277,10 +278,15 @@ ambient context. To keep work flowing:
   `./scripts/release.sh`) is invisible to the hook. Wrapped commands that
   resolve their own targets are usually the *safe* path — the guard exists
   for the ad-hoc commands.
-- **Classification is by name.** A production context charmingly named
-  `blue-cluster-2` is UNKNOWN (prompted, not denied) until you add a
-  pattern. The fail-closed default means unknown never silently passes, but
-  the hard block needs your patterns to know what "prod" means in your org.
+- **Classification is by name — plus, for kube-contexts, the cluster's
+  server URL.** A production context charmingly named `blue-cluster-2` is
+  caught if its kubeconfig `server:` URL matches a prod pattern (e.g.
+  `https://api.prod-us.example.com`); if the URL is also unremarkable it stays
+  UNKNOWN (prompted, not denied) until you add a pattern. The fail-closed
+  default means unknown never silently passes, but the hard block needs your
+  patterns to know what "prod" means in your org. Server resolution covers
+  `kubectl`/`oc`/`flux`/`helm` and context switches (`kubectx`,
+  `kubectl config use-context`); other tools classify by name only.
 - `gh` is denylist-only: its implied target (the cwd repo's remote) is
   pinned by the worktree, not clobber-prone shared state, and prompting on
   every `gh pr create` would be pure noise. A mutating `gh` command is only

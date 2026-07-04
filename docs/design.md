@@ -37,6 +37,10 @@ workspace-guard and branch-guard default to `ask` because their false positives 
 
 A denylist that silently allows whatever it doesn't recognize protects only orgs whose production is literally named "prod". Real environments have GCP project ids, cluster names, and subscription GUIDs that no built-in pattern can anticipate. Prompting on unknown+mutating makes the gap visible exactly when it matters, and the fix (add a pattern) is one config line. The reverse default — allow on unknown — would make the guard decorative.
 
+### Why kube-contexts also classify by their cluster's server URL
+
+Classifying a kube-context purely by name misses the most dangerous case: a production cluster reached through an innocuous context name (`blue-2`, `cluster-7`). The kubeconfig already records the mapping — context → cluster → `server:` URL — so the guard resolves it locally (the same regex-over-YAML trade as reading `current-context:`) and classifies the server URL alongside the name. The verdict is the worst of the two on the prod > nonprod > unknown lattice, so this is purely additive: a prod server upgrades an unknown or nonprod-looking name to a deny, and an unresolvable server (flow-style YAML, a context defined in a kubeconfig outside `$KUBECONFIG`, a parse miss) simply falls back to name-only — it can never downgrade a name that already classifies prod. Server resolution is deliberately scoped to the kubeconfig tools (`kubectl`/`oc`/`flux`/`helm` and the `kubectx` / `use-context` switches); other tools' targets (project ids, subscriptions, profiles) have no comparable cheap local URL to resolve.
+
 ### Why the guard never emits `allow`
 
 An `allow` from one hook can ride past both the user's permission settings and the *other* guard hooks (composition order between hooks is not a documented contract). prod-guard's job is to add a boundary, not to reduce prompts, so its only outputs are `deny`, `ask`, and silence. This also means installing it can never weaken any other guard.

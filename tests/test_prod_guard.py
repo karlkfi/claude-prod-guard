@@ -38,6 +38,32 @@ _spec.loader.exec_module(guard)
 KUBECONFIG_KIND = "apiVersion: v1\nkind: Config\ncurrent-context: kind-ci\n"
 KUBECONFIG_PROD = "apiVersion: v1\nkind: Config\ncurrent-context: gke_acme_prod-us\n"
 
+# Full block-style kubeconfig where context names give nothing away: `blue-2`
+# maps to a cluster whose server URL is production, `green-1` to a kind server.
+# Only server-URL classification catches `blue-2`.
+KUBECONFIG_SERVER = """apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: SYNTHETIC
+    server: https://api.acme-prod-us.example.com:6443
+  name: acme-prod-us-cluster
+- cluster:
+    server: https://127.0.0.1:6443
+  name: kind-local
+contexts:
+- context:
+    cluster: acme-prod-us-cluster
+    namespace: default
+    user: admin
+  name: blue-2
+- context:
+    cluster: kind-local
+    user: kind
+  name: green-1
+current-context: blue-2
+"""
+
 
 def make_home(kubeconfig=None, gcloud_project=None, docker_context=None,
               az_subscription=None, az_bom=False, argocd_context=None):
@@ -265,6 +291,105 @@ class KubectlDecisionTests(unittest.TestCase):
         self.assertIsNone(decision)
         decision, _ = run_hook("kubectl config current-context")
         self.assertIsNone(decision)
+
+
+class KubeServerClassificationTests(unittest.TestCase):
+    """A prod cluster reached through an innocuously named context (`blue-2`)
+    is caught by classifying the cluster's server URL, not just the name."""
+
+    def setUp(self):
+        guard._PATTERNS = None
+
+    def test_parse_kubeconfig_maps(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "config")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(KUBECONFIG_SERVER)
+        c2c, c2s = guard._parse_kubeconfig(p)
+        self.assertEqual(c2c["blue-2"], "acme-prod-us-cluster")
+        self.assertEqual(c2c["green-1"], "kind-local")
+        self.assertEqual(c2s["acme-prod-us-cluster"],
+                         "https://api.acme-prod-us.example.com:6443")
+
+    def test_classify_kube_server_prod(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "config")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(KUBECONFIG_SERVER)
+        seg = {"KUBECONFIG": p}
+        self.assertEqual(guard.classify_kube("blue-2", seg), "prod")
+        self.assertEqual(guard.classify_kube("green-1", seg), "nonprod")
+        self.assertEqual(guard.classify_kube("not-in-config", seg), "unknown")
+
+    def test_explicit_context_prod_server_denied(self):
+        home = make_home(kubeconfig=KUBECONFIG_SERVER)
+        decision, reason = run_hook(
+            "kubectl --context blue-2 delete ns x", home=home)
+        self.assertEqual(decision, "deny")
+        self.assertIn("blue-2", reason)
+
+    def test_explicit_context_prod_server_readonly_defers(self):
+        home = make_home(kubeconfig=KUBECONFIG_SERVER)
+        decision, _ = run_hook(
+            "kubectl --context blue-2 get pods", home=home)
+        self.assertIsNone(decision)
+
+    def test_ambient_prod_server_denied(self):
+        # current-context is blue-2 (prod server); no explicit pin.
+        home = make_home(kubeconfig=KUBECONFIG_SERVER)
+        decision, reason = run_hook("kubectl delete pod x", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_nonprod_server_context_defers(self):
+        # green-1's server is a kind loopback: unknown NAME, nonprod SERVER,
+        # so an explicit pin resolves to nonprod and defers.
+        home = make_home(kubeconfig=KUBECONFIG_SERVER)
+        decision, _ = run_hook(
+            "kubectl --context green-1 delete pod x", home=home)
+        self.assertIsNone(decision)
+
+    def test_kubectx_prod_server_denied(self):
+        home = make_home(kubeconfig=KUBECONFIG_SERVER)
+        decision, _ = run_hook("kubectx blue-2", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_use_context_prod_server_denied(self):
+        home = make_home(kubeconfig=KUBECONFIG_SERVER)
+        decision, _ = run_hook("kubectl config use-context blue-2", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_helm_prod_server_denied(self):
+        home = make_home(kubeconfig=KUBECONFIG_SERVER)
+        decision, _ = run_hook(
+            "helm --kube-context blue-2 upgrade r ./chart", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_unresolved_server_falls_back_to_name(self):
+        # An unknown context not present in the kubeconfig keeps name-only
+        # behavior: unknown name + mutating => ask (regression guard).
+        home = make_home(kubeconfig=KUBECONFIG_SERVER)
+        decision, _ = run_hook(
+            "kubectl --context bluefin apply -f m.yaml", home=home)
+        self.assertEqual(decision, "ask")
+
+    def test_multi_path_kubeconfig_resolves_server(self):
+        # Context in the first file, cluster/server in the second.
+        home = make_home()
+        d = tempfile.mkdtemp()
+        a = os.path.join(d, "a")
+        b = os.path.join(d, "b")
+        with open(a, "w", encoding="utf-8") as f:
+            f.write("contexts:\n- context:\n    cluster: pc\n  name: ctx-a\n"
+                    "current-context: ctx-a\n")
+        with open(b, "w", encoding="utf-8") as f:
+            f.write("clusters:\n- cluster:\n    server: https://prod.example.com\n"
+                    "  name: pc\n")
+        decision, _ = run_hook(
+            "kubectl --context ctx-a delete ns x", home=home,
+            env_extra={"KUBECONFIG": a + ":" + b})
+        self.assertEqual(decision, "deny")
 
 
 class CompoundBypassTests(unittest.TestCase):
