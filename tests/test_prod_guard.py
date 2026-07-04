@@ -897,6 +897,154 @@ class EksctlDoctlTests(unittest.TestCase):
         self.assertIsNone(decision)
 
 
+class PulumiTests(unittest.TestCase):
+    """Q4: pulumi targets the stack. Explicit --stack/-s is classified; no
+    stack pinned prompts (ambient selected stack is not read from disk)."""
+
+    def test_up_prod_stack_denied(self):
+        decision, reason = run_hook("pulumi up --stack acme/prod --yes")
+        self.assertEqual(decision, "deny")
+        self.assertIn("prod", reason)
+
+    def test_up_dev_stack_defers(self):
+        decision, _ = run_hook("pulumi up -s dev --yes")
+        self.assertIsNone(decision)
+
+    def test_up_no_stack_asks(self):
+        decision, reason = run_hook("pulumi up --yes")
+        self.assertEqual(decision, "ask")
+        self.assertIn("--stack", reason)
+
+    def test_preview_prod_defers(self):
+        decision, _ = run_hook("pulumi preview --stack acme/prod")
+        self.assertIsNone(decision)
+
+    def test_destroy_prod_denied(self):
+        decision, _ = run_hook("pulumi destroy -s prod --yes")
+        self.assertEqual(decision, "deny")
+
+    def test_unknown_stack_asks(self):
+        decision, reason = run_hook("pulumi up --stack bluefin --yes")
+        self.assertEqual(decision, "ask")
+        self.assertIn("bluefin", reason)
+
+    def test_stack_select_prod_denied(self):
+        decision, _ = run_hook("pulumi stack select acme/prod")
+        self.assertEqual(decision, "deny")
+
+    def test_stack_select_nonprod_asks(self):
+        decision, reason = run_hook("pulumi stack select dev")
+        self.assertEqual(decision, "ask")
+        self.assertIn("selected pulumi stack", reason)
+
+    def test_stack_rm_prod_denied(self):
+        decision, _ = run_hook("pulumi stack rm prod --yes")
+        self.assertEqual(decision, "deny")
+
+    def test_stack_ls_defers(self):
+        decision, _ = run_hook("pulumi stack ls")
+        self.assertIsNone(decision)
+
+    def test_config_set_prod_stack_denied(self):
+        decision, _ = run_hook("pulumi config set foo bar --stack acme/prod")
+        self.assertEqual(decision, "deny")
+
+    def test_config_get_prod_stack_defers(self):
+        decision, _ = run_hook("pulumi config get foo --stack acme/prod")
+        self.assertIsNone(decision)
+
+    def test_whoami_and_version_defer(self):
+        for cmd in ("pulumi whoami", "pulumi version", "pulumi about"):
+            with self.subTest(cmd=cmd):
+                decision, _ = run_hook(cmd)
+                self.assertIsNone(decision)
+
+    def test_login_asks(self):
+        decision, _ = run_hook("pulumi login")
+        self.assertEqual(decision, "ask")
+
+    def test_refresh_prod_denied(self):
+        decision, _ = run_hook("pulumi refresh -s prod --yes")
+        self.assertEqual(decision, "deny")
+
+
+class AnsibleTests(unittest.TestCase):
+    """Q4: ansible / ansible-playbook target the inventory. The inventory is
+    authoritative; the host pattern and --limit can only escalate to deny."""
+
+    def test_playbook_prod_inventory_denied(self):
+        decision, reason = run_hook(
+            "ansible-playbook -i inventories/prod/hosts site.yml")
+        self.assertEqual(decision, "deny")
+        self.assertIn("inventories/prod/hosts", reason)
+
+    def test_playbook_dev_inventory_defers(self):
+        decision, _ = run_hook(
+            "ansible-playbook -i inventories/dev/hosts site.yml")
+        self.assertIsNone(decision)
+
+    def test_playbook_unknown_inventory_asks(self):
+        decision, reason = run_hook("ansible-playbook -i hosts.ini site.yml")
+        self.assertEqual(decision, "ask")
+        self.assertIn("hosts.ini", reason)
+
+    def test_limit_prod_escalates_to_deny(self):
+        decision, _ = run_hook(
+            "ansible-playbook -i hosts.ini --limit prod-web site.yml")
+        self.assertEqual(decision, "deny")
+
+    def test_unknown_pattern_with_nonprod_inventory_defers(self):
+        # `webservers` is unknown, but the -i inventory resolves nonprod, so
+        # the pattern must not force a prompt.
+        decision, _ = run_hook(
+            "ansible webservers -i inventories/dev/hosts -m service "
+            "-a 'name=x state=restarted'")
+        self.assertIsNone(decision)
+
+    def test_adhoc_prod_pattern_shell_denied(self):
+        decision, _ = run_hook("ansible prod-db -m shell -a reboot")
+        self.assertEqual(decision, "deny")
+
+    def test_adhoc_ping_prod_defers(self):
+        # ping is read-only even against a prod-named pattern.
+        decision, _ = run_hook("ansible prod-db -m ping")
+        self.assertIsNone(decision)
+
+    def test_no_inventory_no_config_asks(self):
+        decision, reason = run_hook("ansible-playbook site.yml")
+        self.assertEqual(decision, "ask")
+        self.assertIn("-i", reason)
+
+    def test_env_inventory_prod_denied(self):
+        decision, _ = run_hook(
+            "ANSIBLE_INVENTORY=inventories/prod ansible-playbook site.yml")
+        self.assertEqual(decision, "deny")
+
+    def test_ambient_cfg_prod_denied(self):
+        home = make_home()
+        with open(os.path.join(home, "ansible.cfg"), "w", encoding="utf-8") as f:
+            f.write("[defaults]\ninventory = ./inventories/prod\n")
+        decision, _ = run_hook("ansible-playbook site.yml", home=home, cwd=home)
+        self.assertEqual(decision, "deny")
+
+    def test_ambient_cfg_dev_defers(self):
+        home = make_home()
+        with open(os.path.join(home, "ansible.cfg"), "w", encoding="utf-8") as f:
+            f.write("[defaults]\ninventory = ./inventories/dev\n")
+        decision, _ = run_hook("ansible-playbook site.yml", home=home, cwd=home)
+        self.assertIsNone(decision)
+
+    def test_syntax_check_defers(self):
+        decision, _ = run_hook(
+            "ansible-playbook -i inventories/prod/hosts --syntax-check site.yml")
+        self.assertIsNone(decision)
+
+    def test_list_hosts_defers(self):
+        decision, _ = run_hook(
+            "ansible-playbook -i inventories/prod/hosts --list-hosts site.yml")
+        self.assertIsNone(decision)
+
+
 class InfrastructureTests(unittest.TestCase):
     def test_uncovered_tool_defers(self):
         decision, _ = run_hook("ls -la")
