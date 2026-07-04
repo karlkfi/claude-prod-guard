@@ -30,6 +30,15 @@ ships as a single Python script that uses only the standard library.
 - It never runs the guarded tools, never contacts a cluster or cloud API,
   and writes nothing to disk.
 
+## The friction-report command
+
+prod-guard ships an optional `/prod-guard:friction-report` command (and the
+`scripts/friction-report.py` script behind it). It is a **read-only** analyzer:
+it re-reads the hook decisions Claude Code already recorded in your local session
+transcripts under `~/.claude/projects/**/*.jsonl` and prints a summary. It adds
+no telemetry, makes no network connections, writes nothing to disk, and never
+runs any guarded tool. Nothing leaves your machine.
+
 ## Third parties
 
 The plugin makes no network connections and shares no data with any third

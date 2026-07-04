@@ -1612,6 +1612,14 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(market["plugins"][0]["name"], "prod-guard")
         self.assertEqual(plugin["version"], market["plugins"][0]["version"])
 
+    def test_friction_report_command_points_at_script(self):
+        # The read-only analyzer command must invoke the real script name.
+        cmd_md = REPO / "commands" / "friction-report.md"
+        self.assertTrue(cmd_md.exists())
+        body = cmd_md.read_text(encoding="utf-8")
+        self.assertIn("scripts/friction-report.py", body)
+        self.assertTrue((REPO / "scripts" / "friction-report.py").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
