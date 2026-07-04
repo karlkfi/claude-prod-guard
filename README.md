@@ -89,6 +89,7 @@ across `&&`/`|`/`;`/`$( )` chains):
 | `kubectl --context blue-2 delete ns x` (cluster server is `api.prod…`) | **deny** |
 | `kubectl scale deploy x --replicas=0` (current-context is prod) | **deny** |
 | `TF_WORKSPACE=prod terraform apply` | **deny** |
+| `TF_WORKSPACE=dev terraform apply` (S3 backend bucket is `acme-prod-tfstate`) | **deny** |
 | `gcloud compute instances delete vm1 --project acme-prod` | **deny** |
 | `docker push registry.prod.acme.io/app:1` | **deny** |
 | `echo done && kubectl --context prod-us delete ns x` | **deny** |
@@ -163,7 +164,7 @@ mode that matters.
 | `gcloud` | `--project` / `--zone` / `--region` / `--account`, `CLOUDSDK_CORE_PROJECT` | project of the active gcloud configuration |
 | `aws`, `eksctl` | `--profile` / `--region`, `AWS_PROFILE` | the default profile (never read — always prompts) |
 | `az` | `--subscription` | default subscription in `~/.azure/azureProfile.json` |
-| `terraform` / `tofu` | `TF_WORKSPACE` | `.terraform/environment` in the working dir; `apply`/`destroy` are always treated as mutating |
+| `terraform` / `tofu` | `TF_WORKSPACE` | `.terraform/environment` in the working dir; the initialized backend's state location (S3/GCS bucket, Terraform Cloud org/workspace) from `.terraform/terraform.tfstate` is classified too, so a prod state location denies even behind an innocuous workspace name; `apply`/`destroy` are always treated as mutating |
 | `docker`, `podman`, `nerdctl`, `docker-compose` | `--context` / `--connection`, `DOCKER_HOST` / `CONTAINER_HOST` | `currentContext` in `~/.docker/config.json`; a local-daemon context defers. `docker push` classifies the image ref's registry; `build --push` classifies **every** `-t` tag; `compose push` fails closed (the registry lives in the compose file, which the hook doesn't parse) |
 | `gh` | `-R`/`--repo`, `GH_REPO` | the cwd repo's `origin` remote (denylist-only — see [Limitations](#limitations)) |
 | `argocd` | `--server` | `current-context` in `~/.config/argocd/config` |

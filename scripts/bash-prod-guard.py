@@ -604,6 +604,89 @@ def terraform_workspace(cwd):
         return None
 
 
+# Well-known "where the state lives" fields per backend type. These name the
+# remote state location (a bucket/key/org/workspace) and are safe to echo in a
+# decision message — never a credential.
+_TF_BACKEND_FIELDS = {
+    's3': ('bucket', 'key'),
+    'gcs': ('bucket', 'prefix'),
+    'azurerm': ('storage_account_name', 'container_name', 'key'),
+    'oss': ('bucket', 'prefix'),   # alibaba
+    'cos': ('bucket', 'prefix'),   # tencent
+}
+
+
+def terraform_backend(cwd):
+    """The remote state location `terraform init` recorded in
+    .terraform/terraform.tfstate, as (type, named, extra):
+
+    - named  = echoable state-location strings (bucket/key/org/workspace) for
+      the known backend types.
+    - extra  = every string leaf of an unknown/future backend's config
+      (classify-only; never echoed, since it may include a credential).
+
+    None when there is no initialized remote backend: missing/unreadable file,
+    malformed JSON, no `backend` object, or a `local` backend. Fail OPEN."""
+    path = os.path.join(cwd or '.', '.terraform', 'terraform.tfstate')
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    be = data.get('backend')
+    if not isinstance(be, dict):
+        return None
+    btype = be.get('type')
+    cfg = be.get('config')
+    if not isinstance(btype, str) or not isinstance(cfg, dict):
+        return None
+    if btype == 'local':
+        return None
+    if btype in ('remote', 'cloud'):
+        named = []
+        org = cfg.get('organization')
+        if isinstance(org, str):
+            named.append(org)
+        ws = cfg.get('workspaces')
+        if isinstance(ws, dict):
+            for key in ('name', 'prefix'):
+                val = ws.get(key)
+                if isinstance(val, str):
+                    named.append(val)
+            tags = ws.get('tags')
+            if isinstance(tags, list):
+                named += [t for t in tags if isinstance(t, str)]
+        return (btype, named, [])
+    fields = _TF_BACKEND_FIELDS.get(btype)
+    if fields is not None:
+        named = [cfg[k] for k in fields if isinstance(cfg.get(k), str)]
+        return (btype, named, [])
+    # Unknown/future backend: classify every string leaf as a secure catch-all,
+    # but report only the type — an incidental credential must never be echoed.
+    extra = [v for v in cfg.values() if isinstance(v, str)]
+    return (btype, [], extra)
+
+
+def terraform_backend_prod(cwd):
+    """Deny description if the initialized backend's state location matches a
+    prod pattern, else None. Known types echo the matched location; the
+    unknown-type catch-all reports only the backend type. Purely additive:
+    only the PROD verdict affects policy (see the Q3 plan doc)."""
+    be = terraform_backend(cwd)
+    if be is None:
+        return None
+    btype, named, extra = be
+    for val in named:
+        if classify(val) == 'prod':
+            return "the terraform %s backend (%s)" % (btype, val)
+    for val in extra:
+        if classify(val) == 'prod':
+            return "the terraform %s backend" % btype
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Findings and policy
 # ---------------------------------------------------------------------------
@@ -1058,17 +1141,27 @@ def eval_terraform(argv, seg_env, ctx):
     elif verb in TF_READONLY:
         return []
     # apply/destroy/import/taint/refresh/state-rewrite/unknown: mutating.
+    # The backend state location is the real target — a prod bucket/TFC
+    # workspace denies regardless of the (weak-proxy) workspace name. Purely
+    # additive: it only escalates to deny, never silences an ask.
+    cwd = ctx.get('cwd')
     ws = seg_env.get('TF_WORKSPACE') or os.environ.get('TF_WORKSPACE')
     if ws:
         cls = classify(ws)
         if cls == 'prod':
             return [deny_prod(action, "terraform workspace '%s' (TF_WORKSPACE)" % ws)]
+        backend = terraform_backend_prod(cwd)
+        if backend:
+            return [deny_prod(action, backend)]
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "terraform workspace '%s' (TF_WORKSPACE)" % ws)]
-    ambient = terraform_workspace(ctx.get('cwd'))
+    ambient = terraform_workspace(cwd)
     if ambient is not None and classify(ambient) == 'prod':
         return [deny_prod(action, "the selected terraform workspace '%s'" % ambient)]
+    backend = terraform_backend_prod(cwd)
+    if backend:
+        return [deny_prod(action, backend)]
     desc = ("the selected terraform workspace ('%s') and its backend" % ambient
             if ambient else 'an unresolved terraform workspace/backend')
     return [ask_ambient(action, desc, 'TF_WORKSPACE=<workspace> terraform ...')]
