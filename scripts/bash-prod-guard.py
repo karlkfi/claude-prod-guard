@@ -579,6 +579,71 @@ def az_default_subscription():
     return None
 
 
+# Fields of an aws profile / sso-session that name *where* it reaches and are
+# safe to echo in a decision message — never a credential. Ordered by display
+# preference so the first present one is the most identifying.
+_AWS_ECHOABLE_KEYS = (
+    'sso_start_url', 'role_arn', 'sso_session', 'sso_account_id',
+    'sso_role_name', 'source_profile', 'sso_region', 'region',
+)
+
+
+def _parse_ini_sections(path):
+    """`{section_name: {lower_key: value}}` from an INI file (the AWS config
+    shape). Full-line `#`/`;` comments skipped; inline comments are left in the
+    value (AWS does not strip them). Unreadable/missing -> {} (fail OPEN)."""
+    sections = {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            cur = None
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith('#') or s.startswith(';'):
+                    continue
+                if s.startswith('[') and s.endswith(']'):
+                    cur = s[1:-1].strip()
+                    sections.setdefault(cur, {})
+                    continue
+                if cur is not None and '=' in line:
+                    key, _, val = line.partition('=')
+                    sections[cur][key.strip().lower()] = val.strip()
+    except OSError:
+        return {}
+    return sections
+
+
+def aws_default_profile(seg_env):
+    """(named, extra) classifiable strings from the `[default]` profile in
+    ~/.aws/config (or $AWS_CONFIG_FILE), following an `sso_session` reference
+    into its `[sso-session NAME]` block.
+
+    - named = echoable identifiers (sso_start_url/role_arn/...), in display
+      preference order so named[0] is the most identifying present field.
+    - extra = every other key's value (classify-only, never echoed — a
+      credential_process command may live here).
+
+    None when the file or the `[default]` section is missing/unreadable, i.e.
+    there is no ambient default profile to resolve (fail OPEN -> generic ask)."""
+    path = seg_env.get('AWS_CONFIG_FILE') or os.environ.get('AWS_CONFIG_FILE')
+    if not path:
+        home = os.environ.get('HOME')
+        if not home:
+            return None
+        path = os.path.join(home, '.aws', 'config')
+    sections = _parse_ini_sections(path)
+    profile = sections.get('default')
+    if profile is None:
+        return None
+    merged = dict(profile)
+    sso = profile.get('sso_session')
+    if sso:
+        merged.update(sections.get('sso-session ' + sso, {}))
+    named = [merged[k] for k in _AWS_ECHOABLE_KEYS if merged.get(k)]
+    extra = [v for k, v in merged.items()
+             if k not in _AWS_ECHOABLE_KEYS and v]
+    return named, extra
+
+
 def git_remote_url(cwd):
     """origin URL of the repo at cwd — gh's implied target. A local `git
     config` read (worktree-aware), never a network call."""
@@ -1080,8 +1145,26 @@ def eval_aws(argv, seg_env, ctx):
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, desc)]
-    return [ask_ambient(action, 'the ambient default aws profile',
-                        'aws --profile <name> (or AWS_PROFILE=<name>)')]
+    # No explicit profile pinned: the target is the `[default]` profile, whose
+    # sso_start_url / role_arn / sso_session in ~/.aws/config name the account
+    # it reaches. A prod default profile denies; anything else still asks
+    # (ambient), now naming what resolved. Purely additive over the prior
+    # always-ask — a missing/unreadable config resolves nothing.
+    pin = 'aws --profile <name> (or AWS_PROFILE=<name>)'
+    resolved = aws_default_profile(seg_env)
+    if resolved is not None:
+        named, extra = resolved
+        for v in named:
+            if classify(v) == 'prod':
+                return [deny_prod(action,
+                        "the default aws profile (%s) (ambient)" % v)]
+        for v in extra:
+            if classify(v) == 'prod':
+                return [deny_prod(action, 'the default aws profile (ambient)')]
+        if named:
+            return [ask_ambient(
+                action, "the ambient default aws profile (%s)" % named[0], pin)]
+    return [ask_ambient(action, 'the ambient default aws profile', pin)]
 
 
 def eval_az(argv, seg_env, ctx):

@@ -66,9 +66,15 @@ current-context: blue-2
 
 
 def make_home(kubeconfig=None, gcloud_project=None, docker_context=None,
-              az_subscription=None, az_bom=False, argocd_context=None):
+              az_subscription=None, az_bom=False, argocd_context=None,
+              aws_config=None):
     """Build a synthetic $HOME holding whichever ambient configs a test needs."""
     home = tempfile.mkdtemp(prefix="prod-guard-test-home-")
+    if aws_config is not None:
+        wdir = os.path.join(home, ".aws")
+        os.makedirs(wdir)
+        with open(os.path.join(wdir, "config"), "w", encoding="utf-8") as f:
+            f.write(aws_config)
     if kubeconfig is not None:
         kube_dir = os.path.join(home, ".kube")
         os.makedirs(kube_dir)
@@ -546,6 +552,40 @@ class GcloudTests(unittest.TestCase):
         self.assertEqual(decision, "ask")
 
 
+class AwsDefaultProfileTests(unittest.TestCase):
+    """Unit tests for the ~/.aws/config [default] profile resolver."""
+
+    def _resolve(self, text):
+        d = tempfile.mkdtemp(prefix="prod-guard-aws-")
+        path = os.path.join(d, "config")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return guard.aws_default_profile({"AWS_CONFIG_FILE": path})
+
+    def test_named_ordered_and_extra_split(self):
+        named, extra = self._resolve(
+            "[default]\nregion = us-east-1\n"
+            "sso_start_url = https://acme-prod.awsapps.com/start\n"
+            "output = json\n")
+        # sso_start_url outranks region in display order despite file order.
+        self.assertEqual(named[0], "https://acme-prod.awsapps.com/start")
+        self.assertIn("us-east-1", named)
+        self.assertEqual(extra, ["json"])  # non-echoable key -> classify-only
+
+    def test_follows_sso_session(self):
+        named, _ = self._resolve(
+            "[default]\nsso_session = corp\n"
+            "[sso-session corp]\nsso_start_url = https://x-prod.awsapps.com/start\n")
+        self.assertIn("https://x-prod.awsapps.com/start", named)
+
+    def test_missing_default_section(self):
+        self.assertIsNone(self._resolve("[profile other]\nregion = us-east-1\n"))
+
+    def test_missing_file(self):
+        self.assertIsNone(
+            guard.aws_default_profile({"AWS_CONFIG_FILE": "/no/such/aws/config"}))
+
+
 class AwsAzTests(unittest.TestCase):
     def test_terminate_prod_profile_denied(self):
         decision, _ = run_hook(
@@ -562,7 +602,88 @@ class AwsAzTests(unittest.TestCase):
         self.assertIsNone(decision)
 
     def test_s3_rm_no_profile_asks(self):
+        # No ~/.aws/config -> nothing to resolve -> generic ambient ask.
         decision, reason = run_hook("aws s3 rm s3://bucket/key")
+        self.assertEqual(decision, "ask")
+        self.assertIn("--profile", reason)
+
+    def test_default_profile_sso_prod_denied(self):
+        home = make_home(aws_config=(
+            "[default]\n"
+            "sso_start_url = https://acme-prod.awsapps.com/start\n"
+            "sso_account_id = 111122223333\n"
+            "region = us-east-1\n"))
+        decision, reason = run_hook(
+            "aws ec2 terminate-instances --instance-ids i-1", home=home)
+        self.assertEqual(decision, "deny")
+        self.assertIn("acme-prod", reason)
+
+    def test_default_profile_role_arn_prod_denied(self):
+        home = make_home(aws_config=(
+            "[default]\nrole_arn = arn:aws:iam::123456789012:role/prod-admin\n"
+            "source_profile = base\n"))
+        decision, _ = run_hook("aws s3 rm s3://bucket/key", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_default_profile_sso_session_name_prod_denied(self):
+        home = make_home(aws_config="[default]\nsso_session = acme-prod\n")
+        decision, _ = run_hook("aws s3 rm s3://bucket/key", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_default_profile_follows_sso_session_ref(self):
+        # The prod signal lives in the referenced [sso-session] block, not the
+        # profile itself.
+        home = make_home(aws_config=(
+            "[default]\nsso_session = corp\nsso_account_id = 444455556666\n"
+            "\n[sso-session corp]\n"
+            "sso_start_url = https://acme-production.awsapps.com/start\n"
+            "sso_region = us-east-1\n"))
+        decision, _ = run_hook("aws s3 rm s3://bucket/key", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_default_profile_credential_process_prod_denied_no_echo(self):
+        # A prod string in a non-echoable key denies but is never echoed.
+        home = make_home(aws_config=(
+            "[default]\ncredential_process = /opt/prod-creds/get.sh\n"))
+        decision, reason = run_hook("aws s3 rm s3://bucket/key", home=home)
+        self.assertEqual(decision, "deny")
+        self.assertNotIn("prod-creds", reason)
+
+    def test_default_profile_dev_still_asks_with_name(self):
+        home = make_home(aws_config=(
+            "[default]\nsso_start_url = https://acme-dev.awsapps.com/start\n"))
+        decision, reason = run_hook("aws s3 rm s3://bucket/key", home=home)
+        self.assertEqual(decision, "ask")
+        self.assertIn("acme-dev", reason)
+
+    def test_default_profile_unknown_still_asks_with_name(self):
+        home = make_home(aws_config=(
+            "[default]\nsso_start_url = https://bluefin.awsapps.com/start\n"))
+        decision, reason = run_hook("aws s3 rm s3://bucket/key", home=home)
+        self.assertEqual(decision, "ask")
+        self.assertIn("bluefin", reason)
+
+    def test_aws_config_file_env_override(self):
+        home = make_home()
+        cfg = os.path.join(home, "custom-aws-config")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write("[default]\nsso_start_url = https://acme-prod.awsapps.com/start\n")
+        decision, _ = run_hook("aws s3 rm s3://bucket/key", home=home,
+                               env_extra={"AWS_CONFIG_FILE": cfg})
+        self.assertEqual(decision, "deny")
+
+    def test_explicit_profile_wins_over_default_config(self):
+        # An explicit nonprod --profile defers even when the [default] is prod.
+        home = make_home(aws_config=(
+            "[default]\nsso_start_url = https://acme-prod.awsapps.com/start\n"))
+        decision, _ = run_hook(
+            "aws s3 rm s3://bucket/key --profile dev", home=home)
+        self.assertIsNone(decision)
+
+    def test_default_profile_malformed_config_asks(self):
+        # Garbage config resolves nothing -> generic ambient ask (fail-open).
+        home = make_home(aws_config="}}}not ini at all{{{\n")
+        decision, reason = run_hook("aws s3 rm s3://bucket/key", home=home)
         self.assertEqual(decision, "ask")
         self.assertIn("--profile", reason)
 
