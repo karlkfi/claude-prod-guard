@@ -22,8 +22,10 @@ A `PreToolUse` hook on `Bash` that:
 3. Resolves the **effective target**: the explicit flag (`--context`, `--project`, `--profile`, `--subscription`, …) or pinning env assignment if present; otherwise the tool's ambient config file, read locally; otherwise UNKNOWN.
 4. Classifies the target against configurable prod/nonprod regex lists (prod checked first) and applies the matrix:
    - PROD + mutating → **deny** (override downgrades to ask)
-   - UNKNOWN + mutating → **ask** (fail closed)
-   - ambient + mutating → **ask** (deny if the ambient value is prod)
+   - UNKNOWN explicit target + mutating → **ask** (fail closed)
+   - no explicit target (ambient) + mutating → **deny** with a self-healing
+     fix-it naming the pin flag (deny-with-reason, not ask; override downgrades
+     to ask)
    - context-switching command → **ask** (deny if the new target is prod)
    - everything else → **defer** (no output)
 
@@ -37,19 +39,54 @@ workspace-guard and branch-guard default to `ask` because their false positives 
 
 A denylist that silently allows whatever it doesn't recognize protects only orgs whose production is literally named "prod". Real environments have GCP project ids, cluster names, and subscription GUIDs that no built-in pattern can anticipate. Prompting on unknown+mutating makes the gap visible exactly when it matters, and the fix (add a pattern) is one config line. The reverse default — allow on unknown — would make the guard decorative.
 
+### Why an unpinned mutation is denied, not prompted
+
+A mutating command that names no explicit target (`kubectl delete pod x` with no
+`--context`, `terraform apply` with no `TF_WORKSPACE`) runs against whatever the
+shared ambient state — kubeconfig `current-context`, the active gcloud config,
+the default AWS profile — happens to point at when it *executes*, which a
+parallel session can repoint between the moment the command is written and the
+moment it runs. Prompting on this (the earlier behavior) put a human in the loop
+on a target that is ambiguous by construction, and taught nothing: the next
+unpinned command prompts again. Denying with a fix-it that names the resolved
+target and the flag to add is strictly better on both axes this guard cares
+about. Security: the command cannot run until the target is explicit, closing
+the write-vs-run race instead of asking a human to reason about it. Friction:
+the deny is *machine-actionable* — the agent re-runs with `--context <ctx>`
+pinned (which then classifies and, if non-prod, defers silently) in one round
+trip, rather than stalling on a permission prompt. This is why the unpinned case
+is the one deny that is not about prod at all; the `PROD_GUARD_OVERRIDE`
+downgrade still applies, so a genuinely un-pinnable command remains runnable in
+one deliberate, auditable step. It also machine-generates the target line the
+downstream convention used to hand-write: the resolved context/project/namespace
+travels in the decision reason, so the human who does see a prompt (an unknown
+explicit target, or an overridden deny) always sees where the mutation lands,
+with no risk of an agent-authored echo that doesn't match the real flags.
+
+The carve-outs are deliberate. A command whose *whole purpose* is to switch
+shared state (`kubectl config use-context`, `kubectx`, `gcloud config set`) has
+no per-command target to pin, so it stays an `ask` (a deny for a prod switch).
+An *explicit* target that classifies UNKNOWN stays an `ask` too: it is pinned
+(not clobber-prone), just unclassified — the fail-closed confirm, not the
+unpinned deny. And a tool whose "ambient" is cwd/file-scoped rather than
+clobber-prone shared state — docker's local daemon, ansible's `ansible.cfg`
+inventory — keeps deferring on a non-prod ambient target, exactly as before;
+only its genuinely *unresolved* ambient path (which is where `deny_ambient`
+fires) joins the unpinned deny.
+
 ### Why kube-contexts also classify by their cluster's server URL
 
 Classifying a kube-context purely by name misses the most dangerous case: a production cluster reached through an innocuous context name (`blue-2`, `cluster-7`). The kubeconfig already records the mapping — context → cluster → `server:` URL — so the guard resolves it locally (the same regex-over-YAML trade as reading `current-context:`) and classifies the server URL alongside the name. The verdict is the worst of the two on the prod > nonprod > unknown lattice, so this is purely additive: a prod server upgrades an unknown or nonprod-looking name to a deny, and an unresolvable server (flow-style YAML, a context defined in a kubeconfig outside `$KUBECONFIG`, a parse miss) simply falls back to name-only — it can never downgrade a name that already classifies prod. Server resolution is deliberately scoped to the kubeconfig tools (`kubectl`/`oc`/`flux`/`helm` and the `kubectx` / `use-context` switches); other tools' targets (project ids, subscriptions, profiles) have no comparable cheap local URL to resolve.
 
 ### Why terraform also classifies the backend state location
 
-The same weak-proxy problem applies to terraform: the selected workspace (`default`, `main`, a `TF_WORKSPACE` value) is a poor stand-in for what an `apply`/`destroy` actually rewrites — a single S3/GCS bucket or Terraform Cloud organization commonly holds many workspaces, prod among them. `terraform init` records the resolved backend in `.terraform/terraform.tfstate`, so the guard reads that JSON and classifies the state-location fields (bucket + key, GCS prefix, TFC org/workspace/tags) alongside the workspace name. This is deliberately one-directional — a prod backend only *escalates* a decision to deny; a nonprod or unresolvable backend never silences an existing prompt — which keeps it purely additive like the kube-server case. Credentials are never fed into a user-visible message: known backend types echo only the location, and the catch-all for unknown/future backend types classifies every config string but reports just the backend type. A missing file, a `local` backend, or an un-`init`ed directory resolves nothing and leaves the workspace-only behavior unchanged.
+The same weak-proxy problem applies to terraform: the selected workspace (`default`, `main`, a `TF_WORKSPACE` value) is a poor stand-in for what an `apply`/`destroy` actually rewrites — a single S3/GCS bucket or Terraform Cloud organization commonly holds many workspaces, prod among them. `terraform init` records the resolved backend in `.terraform/terraform.tfstate`, so the guard reads that JSON and classifies the state-location fields (bucket + key, GCS prefix, TFC org/workspace/tags) alongside the workspace name. This is deliberately one-directional — a prod backend only *escalates* the decision to a prod deny; a nonprod or unresolvable backend never silences the underlying decision (an explicit non-prod workspace still defers; an unpinned one still denies with the pin-required reason) — which keeps it purely additive like the kube-server case. Credentials are never fed into a user-visible message: known backend types echo only the location, and the catch-all for unknown/future backend types classifies every config string but reports just the backend type. A missing file, a `local` backend, or an un-`init`ed directory resolves nothing and leaves the workspace-only behavior unchanged.
 
-The AWS `[default]` profile gets the same treatment on the ambient path. A mutating `aws` command with no `--profile`/`AWS_PROFILE` runs against `[default]`, whose `~/.aws/config` entry records where it reaches — an `sso_start_url`, an assumed `role_arn`, an `sso_session` name (followed into its `[sso-session]` block). The guard classifies those: a prod default profile denies, while a nonprod/unknown/unresolvable one still prompts, now naming what resolved. Only well-known location fields are echoed; any other key's value (a `credential_process` command) is classify-only, and `~/.aws/credentials` — which holds the secret keys — is never read. Like the terraform backend this is one-directional over the prior always-ask: it can only escalate the ambient prompt to a deny, never silence it. An explicit `--profile NAME`/`AWS_PROFILE` gets the same resolution when its *name* classifies unknown: the guard reads the profile's `[profile NAME]` section (the AWS convention for non-default profiles) and denies if the resolved account is prod, so a prod profile behind an innocuous name (`admin`, `ops`) still blocks. That resolution is scoped to the unknown-name case — a name the user spelled `dev` classifies nonprod and defers even if it references an org-wide prod-looking `sso_start_url`, since the explicit name is a stronger signal than a possibly-shared SSO portal URL. `eksctl` reaches AWS through the same default-profile chain.
+The AWS `[default]` profile gets the same treatment on the ambient path. A mutating `aws` command with no `--profile`/`AWS_PROFILE` runs against `[default]`, whose `~/.aws/config` entry records where it reaches — an `sso_start_url`, an assumed `role_arn`, an `sso_session` name (followed into its `[sso-session]` block). The guard classifies those: a prod default profile denies with the prod reason, while a nonprod/unknown/unresolvable one is denied as an unpinned mutation (pin `--profile`), now naming what resolved so the reason still shows where it would land. Only well-known location fields are echoed; any other key's value (a `credential_process` command) is classify-only, and `~/.aws/credentials` — which holds the secret keys — is never read. Like the terraform backend this is one-directional: the resolution can only escalate the unpinned deny to a prod deny, never silence it. An explicit `--profile NAME`/`AWS_PROFILE` gets the same resolution when its *name* classifies unknown: the guard reads the profile's `[profile NAME]` section (the AWS convention for non-default profiles) and denies if the resolved account is prod, so a prod profile behind an innocuous name (`admin`, `ops`) still blocks. That resolution is scoped to the unknown-name case — a name the user spelled `dev` classifies nonprod and defers even if it references an org-wide prod-looking `sso_start_url`, since the explicit name is a stronger signal than a possibly-shared SSO portal URL. `eksctl` reaches AWS through the same default-profile chain.
 
 ### Why pulumi and ansible each have their own target model
 
-Coverage isn't one shape — each tool's "target" is whatever it actually acts against. For **pulumi** that's the *stack* (`--stack`/`-s`, else the per-project selected stack); the explicit flag is classified, and the ambient selected stack is read from `~/.pulumi/workspaces/` (whose per-project file is keyed by the sha1 of the project path) so an unpinned mutation against a prod selection *denies* — additive over the older always-prompt behavior, since a nonprod/unresolved selection still prompts (the selection is clobber-prone shared state). `pulumi stack select <prod>` is still denied, so the moment a prod stack is chosen is caught. For **ansible** the target is the *inventory* (`-i`, else `ANSIBLE_INVENTORY`/`ansible.cfg`); the inventory is authoritative, and the host pattern / `--limit` can only *escalate* to a deny — never force a prompt on an unknown word (`webservers`) when the inventory itself resolves nonprod. Running a playbook is inherently mutating, so `ansible-playbook` has no read-only verb split; only the never-connecting flags (`--syntax-check`, `--list-*`) and ad-hoc read-only modules (`ping`/`setup`/`debug`) defer. Both fit the existing `EVALUATORS` model with no parser change — a new tool is a new evaluator plus a read-only allowlist.
+Coverage isn't one shape — each tool's "target" is whatever it actually acts against. For **pulumi** that's the *stack* (`--stack`/`-s`, else the per-project selected stack); the explicit flag is classified, and the ambient selected stack is read from `~/.pulumi/workspaces/` (whose per-project file is keyed by the sha1 of the project path) so an unpinned mutation against a prod selection denies with the prod reason, while a nonprod/unresolved selection is denied as an unpinned mutation (pin `--stack`) — the selection is clobber-prone shared state, so it never defers. `pulumi stack select <prod>` is still denied, so the moment a prod stack is chosen is caught. For **ansible** the target is the *inventory* (`-i`, else `ANSIBLE_INVENTORY`/`ansible.cfg`); the inventory is authoritative, and the host pattern / `--limit` can only *escalate* to a deny — never force a prompt on an unknown word (`webservers`) when the inventory itself resolves nonprod. Running a playbook is inherently mutating, so `ansible-playbook` has no read-only verb split; only the never-connecting flags (`--syntax-check`, `--list-*`) and ad-hoc read-only modules (`ping`/`setup`/`debug`) defer. Both fit the existing `EVALUATORS` model with no parser change — a new tool is a new evaluator plus a read-only allowlist.
 
 ### Why the guard never emits `allow`
 
@@ -78,4 +115,4 @@ gh's implied target — the cwd repo's `origin` remote — is pinned by the work
 - **A wrapper script per tool** (`bin/kubectl` shims on PATH). Protects shells too, but requires PATH discipline everywhere, breaks tool auto-update expectations, and doesn't see the assembled command line (a shim can't know it's the third segment of a `&&` chain). The hook sees exactly what will run.
 - **OPA/Conftest-style policy engine.** Overkill: a dependency-heavy runtime for what is a string-classification problem, and it would still need this plugin's parsing to produce input. Stdlib-only Python keeps installation to "have python3".
 - **Admission control on the cluster** (ValidatingWebhooks, constrained RBAC). The right *server-side* defense, and orgs should have it — but it protects one cluster, requires cluster-admin to deploy, and does nothing for gcloud/aws/az/terraform/docker. The hook is the client-side, cross-tool complement, installable by the person running Claude.
-- **Blocking parallel sessions from sharing configs** (per-session `KUBECONFIG`). Solves threat model 2 elegantly where you control the launcher, but it's an environment-management discipline this plugin can't impose; the ask-with-pin-hint teaches the equivalent habit per command.
+- **Blocking parallel sessions from sharing configs** (per-session `KUBECONFIG`). Solves threat model 2 elegantly where you control the launcher, but it's an environment-management discipline this plugin can't impose; the deny-with-pin-hint enforces the equivalent habit per command.

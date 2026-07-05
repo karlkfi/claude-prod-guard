@@ -272,12 +272,24 @@ class KubectlDecisionTests(unittest.TestCase):
         self.assertEqual(decision, "ask")
         self.assertIn("bluefin", reason)
 
-    def test_ambient_mutating_asks(self):
+    def test_ambient_mutating_denied_with_pin_hint(self):
+        # No --context: even a nonprod ambient context denies now (issue #10) —
+        # the target is clobber-prone, so the guard makes the agent pin it. The
+        # deny names the resolved context and the flag to add (self-heal).
         home = make_home(kubeconfig=KUBECONFIG_KIND)
         decision, reason = run_hook("kubectl delete pod x", home=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("kind-ci", reason)
         self.assertIn("--context", reason)
+        self.assertIn("must pin", reason)
+
+    def test_ambient_namespace_echoed_in_reason(self):
+        # Point 2: the parsed namespace is machine-generated into the reason so
+        # the prompt shows where the mutation lands.
+        home = make_home(kubeconfig=KUBECONFIG_KIND)
+        decision, reason = run_hook("kubectl delete pod x -n payments", home=home)
+        self.assertEqual(decision, "deny")
+        self.assertIn("payments", reason)
 
     def test_ambient_prod_denied(self):
         home = make_home(kubeconfig=KUBECONFIG_PROD)
@@ -285,16 +297,17 @@ class KubectlDecisionTests(unittest.TestCase):
         self.assertEqual(decision, "deny")
         self.assertIn("gke_acme_prod-us", reason)
 
-    def test_no_kubeconfig_mutating_asks(self):
+    def test_no_kubeconfig_mutating_denies(self):
+        # No kubeconfig to resolve + no --context: unpinned mutation denies.
         decision, _ = run_hook("kubectl apply -f m.yaml")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
 
     def test_rollout_status_defers_restart_guarded(self):
         home = make_home(kubeconfig=KUBECONFIG_KIND)
         decision, _ = run_hook("kubectl rollout status deploy/x", home=home)
         self.assertIsNone(decision)
         decision, _ = run_hook("kubectl rollout restart deploy/x", home=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")  # unpinned mutation
 
     def test_exec_is_mutating(self):
         decision, _ = run_hook("kubectl --context gke_acme_prod-us exec -it pod -- sh")
@@ -505,10 +518,10 @@ class HelmFluxArgocdTests(unittest.TestCase):
         decision, _ = run_hook("helm list -A")
         self.assertIsNone(decision)
 
-    def test_helm_ambient_install_asks(self):
+    def test_helm_ambient_install_denies(self):
         home = make_home(kubeconfig=KUBECONFIG_KIND)
         decision, reason = run_hook("helm install api ./chart", home=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")  # unpinned mutation
         self.assertIn("--kube-context", reason)
 
     def test_flux_reconcile_prod_denied(self):
@@ -552,10 +565,11 @@ class GcloudTests(unittest.TestCase):
         self.assertEqual(decision, "deny")
         self.assertIn("acme-prod", reason)
 
-    def test_ambient_dev_project_asks(self):
+    def test_ambient_dev_project_denies(self):
+        # Nonprod ambient project still denies — pin --project (issue #10).
         home = make_home(gcloud_project="acme-dev")
         decision, reason = run_hook("gcloud compute instances delete vm1", home=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("--project", reason)
 
     def test_get_credentials_asks(self):
@@ -645,10 +659,10 @@ class AwsAzTests(unittest.TestCase):
         decision, _ = run_hook("aws ec2 describe-instances")
         self.assertIsNone(decision)
 
-    def test_s3_rm_no_profile_asks(self):
-        # No ~/.aws/config -> nothing to resolve -> generic ambient ask.
+    def test_s3_rm_no_profile_denies(self):
+        # No ~/.aws/config -> nothing to resolve -> unpinned mutation denies.
         decision, reason = run_hook("aws s3 rm s3://bucket/key")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("--profile", reason)
 
     def test_default_profile_sso_prod_denied(self):
@@ -693,18 +707,20 @@ class AwsAzTests(unittest.TestCase):
         self.assertEqual(decision, "deny")
         self.assertNotIn("prod-creds", reason)
 
-    def test_default_profile_dev_still_asks_with_name(self):
+    def test_default_profile_dev_still_denies_with_name(self):
+        # A nonprod default profile now denies (unpinned), still naming what
+        # resolved so the prompt shows where it would land.
         home = make_home(aws_config=(
             "[default]\nsso_start_url = https://acme-dev.awsapps.com/start\n"))
         decision, reason = run_hook("aws s3 rm s3://bucket/key", home=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("acme-dev", reason)
 
-    def test_default_profile_unknown_still_asks_with_name(self):
+    def test_default_profile_unknown_still_denies_with_name(self):
         home = make_home(aws_config=(
             "[default]\nsso_start_url = https://bluefin.awsapps.com/start\n"))
         decision, reason = run_hook("aws s3 rm s3://bucket/key", home=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("bluefin", reason)
 
     def test_aws_config_file_env_override(self):
@@ -789,11 +805,12 @@ class AwsAzTests(unittest.TestCase):
         self.assertEqual(decision, "ask")
         self.assertIn("admin", reason)
 
-    def test_default_profile_malformed_config_asks(self):
-        # Garbage config resolves nothing -> generic ambient ask (fail-open).
+    def test_default_profile_malformed_config_denies(self):
+        # Garbage config resolves nothing -> generic unpinned ambient deny
+        # (fail-open on parsing still yields the pin-required deny).
         home = make_home(aws_config="}}}not ini at all{{{\n")
         decision, reason = run_hook("aws s3 rm s3://bucket/key", home=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("--profile", reason)
 
     def test_aws_configure_asks(self):
@@ -829,9 +846,9 @@ class TerraformTests(unittest.TestCase):
         decision, _ = run_hook("terraform plan")
         self.assertIsNone(decision)
 
-    def test_apply_no_workspace_asks(self):
+    def test_apply_no_workspace_denies(self):
         decision, reason = run_hook("terraform apply")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")  # unpinned mutation
         self.assertIn("TF_WORKSPACE", reason)
 
     def test_apply_prod_workspace_denied(self):
@@ -859,9 +876,10 @@ class TerraformTests(unittest.TestCase):
         decision, _ = run_hook("terraform workspace list")
         self.assertIsNone(decision)
 
-    def test_state_rm_asks(self):
+    def test_state_rm_denies(self):
+        # state rm rewrites backend state; unpinned -> deny.
         decision, _ = run_hook("terraform state rm aws_instance.x")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
 
     def test_state_list_defers(self):
         decision, _ = run_hook("terraform state list")
@@ -932,10 +950,10 @@ class TerraformTests(unittest.TestCase):
 
     def test_local_backend_unchanged(self):
         # A local backend has no remote target; behavior falls back to the
-        # workspace-only path (no workspace pinned -> ask).
+        # workspace-only path (no workspace pinned -> unpinned deny).
         home = self._backend_home({"path": "prod.tfstate"}, btype="local")
         decision, _ = run_hook("terraform apply", home=home, cwd=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
 
     def test_prod_workspace_wins_over_nonprod_backend(self):
         home = self._backend_home({"bucket": "acme-dev-tfstate"})
@@ -945,7 +963,8 @@ class TerraformTests(unittest.TestCase):
 
     def test_malformed_backend_state_fails_open(self):
         # Unparseable .terraform/terraform.tfstate -> resolve nothing ->
-        # unchanged workspace-only behavior (fail OPEN on the infra read).
+        # unchanged workspace-only behavior: no workspace pinned -> unpinned
+        # deny (fail OPEN on the infra read still lands on the pin-required deny).
         home = make_home()
         tfdir = os.path.join(home, ".terraform")
         os.makedirs(tfdir)
@@ -953,7 +972,7 @@ class TerraformTests(unittest.TestCase):
                   "w", encoding="utf-8") as f:
             f.write("{ not json")
         decision, _ = run_hook("terraform apply", home=home, cwd=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
 
 
 class DockerTests(unittest.TestCase):
@@ -1128,17 +1147,17 @@ class EksctlDoctlTests(unittest.TestCase):
         self.assertEqual(decision, "deny")
         self.assertIn("acme-prod", reason)
 
-    def test_eksctl_ambient_default_profile_dev_still_asks(self):
+    def test_eksctl_ambient_default_profile_dev_still_denies(self):
         home = make_home(aws_config=(
             "[default]\nsso_start_url = https://acme-dev.awsapps.com/start\n"))
         decision, reason = run_hook("eksctl delete cluster", home=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")  # unpinned -> pin --profile
         self.assertIn("acme-dev", reason)
 
-    def test_eksctl_ambient_no_config_asks(self):
-        # No ~/.aws/config -> nothing to resolve -> generic ambient ask.
+    def test_eksctl_ambient_no_config_denies(self):
+        # No ~/.aws/config -> nothing to resolve -> generic unpinned deny.
         decision, reason = run_hook("eksctl delete cluster")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("--profile", reason)
 
     def test_eksctl_default_profile_env_prod_denied(self):
@@ -1147,9 +1166,12 @@ class EksctlDoctlTests(unittest.TestCase):
             "AWS_DEFAULT_PROFILE=prod-admin eksctl delete cluster")
         self.assertEqual(decision, "deny")
 
-    def test_doctl_delete_no_context_asks(self):
-        decision, _ = run_hook("doctl kubernetes cluster delete c1")
-        self.assertEqual(decision, "ask")
+    def test_doctl_delete_no_context_denies(self):
+        # doctl's auth context isn't read from disk; unpinned -> deny (pin
+        # --context) rather than prompt.
+        decision, reason = run_hook("doctl kubernetes cluster delete c1")
+        self.assertEqual(decision, "deny")
+        self.assertIn("--context", reason)
 
     def test_doctl_list_defers(self):
         decision, _ = run_hook("doctl kubernetes cluster list")
@@ -1159,7 +1181,7 @@ class EksctlDoctlTests(unittest.TestCase):
 class PulumiTests(unittest.TestCase):
     """Q4: pulumi targets the stack. Explicit --stack/-s is classified; no
     stack pinned resolves the per-project selected stack from disk (Q8) — a
-    prod selection denies, anything else keeps the ambient prompt."""
+    prod selection denies, anything else denies as an unpinned mutation (#10)."""
 
     def test_up_prod_stack_denied(self):
         decision, reason = run_hook("pulumi up --stack acme/prod --yes")
@@ -1170,9 +1192,10 @@ class PulumiTests(unittest.TestCase):
         decision, _ = run_hook("pulumi up -s dev --yes")
         self.assertIsNone(decision)
 
-    def test_up_no_stack_asks(self):
+    def test_up_no_stack_denies(self):
+        # No --stack and no resolvable selection -> unpinned deny (pin --stack).
         decision, reason = run_hook("pulumi up --yes")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("--stack", reason)
 
     def test_preview_prod_defers(self):
@@ -1240,16 +1263,17 @@ class PulumiTests(unittest.TestCase):
         self.assertIn("selected pulumi stack", reason)
         self.assertIn("acme/prod", reason)
 
-    def test_ambient_nonprod_selection_still_asks(self):
-        # Additive: a nonprod selection does NOT defer — the per-project
-        # selection is clobber-prone shared state, so it still prompts.
+    def test_ambient_nonprod_selection_still_denies(self):
+        # A nonprod selection does NOT defer — the per-project selection is
+        # clobber-prone shared state, so the unpinned mutation denies (pin
+        # --stack). The reason still names the resolved selection.
         home = make_home()
         cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
         wfile = pulumi_workspace_path(home, cwd, "myproj")
         with open(wfile, "w", encoding="utf-8") as f:
             json.dump({"stack": "dev"}, f)
         decision, reason = run_hook("pulumi up --yes", home=home, cwd=cwd)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("dev", reason)
 
     def test_ambient_pulumi_home_override_honored(self):
@@ -1283,25 +1307,28 @@ class PulumiTests(unittest.TestCase):
         decision, _ = run_hook("pulumi up --stack dev --yes", home=home, cwd=cwd)
         self.assertIsNone(decision)
 
-    def test_no_stack_key_asks(self):
-        # A workspace file with no selection recorded -> unresolved -> ask.
+    def test_no_stack_key_denies(self):
+        # A workspace file with no selection recorded -> unresolved -> unpinned
+        # deny (pin --stack).
         home = make_home()
         cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
         wfile = pulumi_workspace_path(home, cwd, "myproj")
         with open(wfile, "w", encoding="utf-8") as f:
             json.dump({}, f)
         decision, reason = run_hook("pulumi up --yes", home=home, cwd=cwd)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("--stack", reason)
 
-    def test_malformed_workspace_json_fails_open_to_ask(self):
+    def test_malformed_workspace_json_fails_open_to_deny(self):
+        # Fail OPEN on the read (resolve nothing) still lands on the unpinned
+        # deny, since no stack is pinned.
         home = make_home()
         cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
         wfile = pulumi_workspace_path(home, cwd, "myproj")
         with open(wfile, "w", encoding="utf-8") as f:
             f.write("{not json")
         decision, _ = run_hook("pulumi up --yes", home=home, cwd=cwd)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
 
     def test_ambient_walk_up_to_parent_project(self):
         # pulumi finds the nearest Pulumi.yaml walking UP from cwd; the
@@ -1369,9 +1396,10 @@ class AnsibleTests(unittest.TestCase):
         decision, _ = run_hook("ansible prod-db -m ping")
         self.assertIsNone(decision)
 
-    def test_no_inventory_no_config_asks(self):
+    def test_no_inventory_no_config_denies(self):
+        # No -i and no resolvable ambient inventory -> unpinned deny (add -i).
         decision, reason = run_hook("ansible-playbook site.yml")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         self.assertIn("-i", reason)
 
     def test_env_inventory_prod_denied(self):
@@ -1493,9 +1521,11 @@ class BypassBatteryTests(unittest.TestCase):
         self.assertEqual(decision, "deny")
 
     def test_xargs_pipeline(self):
+        # xargs is stripped to the underlying kubectl; no --context -> unpinned
+        # deny even with a nonprod ambient context.
         home = make_home(kubeconfig=KUBECONFIG_KIND)
         decision, _ = run_hook("echo x | xargs kubectl delete ns", home=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
 
     def test_nested_shell_two_levels(self):
         decision, _ = run_hook(
@@ -1705,9 +1735,10 @@ class AmbientFixtureTests(unittest.TestCase):
         decision, _ = run_hook("kubectl delete pod x", home=home)
         self.assertEqual(decision, "deny")
 
-    def test_kubeconfig_prefix_assignment_unresolvable_asks(self):
+    def test_kubeconfig_prefix_assignment_unresolvable_denies(self):
+        # Unresolvable ambient context + no --context -> unpinned deny.
         decision, _ = run_hook("KUBECONFIG=/nonexistent kubectl delete pod x")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
 
     def test_docker_config_without_current_context_defers(self):
         home = make_home()
@@ -1723,10 +1754,12 @@ class AmbientFixtureTests(unittest.TestCase):
         decision, _ = run_hook("argocd app sync api", home=home)
         self.assertEqual(decision, "deny")
 
-    def test_argocd_ambient_unknown_asks(self):
+    def test_argocd_ambient_unknown_denies(self):
+        # Unknown ambient argocd context + no --server -> unpinned deny.
         home = make_home(argocd_context="argocd.internal")
-        decision, _ = run_hook("argocd app sync api", home=home)
-        self.assertEqual(decision, "ask")
+        decision, reason = run_hook("argocd app sync api", home=home)
+        self.assertEqual(decision, "deny")
+        self.assertIn("--server", reason)
 
 
 class SpecialCaseTests(unittest.TestCase):
@@ -1755,9 +1788,10 @@ class SpecialCaseTests(unittest.TestCase):
         decision, _ = run_hook("terraform login")
         self.assertEqual(decision, "ask")
 
-    def test_terraform_state_push_asks(self):
+    def test_terraform_state_push_denies(self):
+        # state push rewrites backend state; unpinned (no workspace) -> deny.
         decision, _ = run_hook("terraform state push errored.tfstate")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
 
     def test_gcloud_auth_login_asks_list_defers(self):
         decision, _ = run_hook("gcloud auth login")
@@ -1823,10 +1857,12 @@ class AliasToolTests(unittest.TestCase):
                 decision, _ = run_hook(cmd)
                 self.assertIsNone(decision)
 
-    def test_oc_ambient_mutation_asks(self):
+    def test_oc_ambient_mutation_denies(self):
+        # oc shares the kubectl evaluator; unpinned mutation -> deny (pin
+        # --context) even against a nonprod ambient context.
         home = make_home(kubeconfig=KUBECONFIG_KIND)
         decision, _ = run_hook("oc new-app nginx", home=home)
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
 
     def test_oc_login_asks(self):
         decision, reason = run_hook("oc login https://api.cluster.example:6443")

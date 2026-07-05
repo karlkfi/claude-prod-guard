@@ -33,23 +33,24 @@ import os
 import re
 import sys
 
-# prod-guard builds every prompt reason from one of four helpers in
-# bash-prod-guard.py, each carrying a stable signature substring. Order matters
+# prod-guard builds every decision reason from one of four helpers in
+# bash-prod-guard.py, each carrying a stable signature substring. Two deny
+# (deny-prod, deny-ambient) and two ask (ask-unknown, ask-switch). Order matters
 # only for display; a reason segment matches exactly one (the signatures are
 # mutually exclusive).
 CATEGORY_PATTERNS = {
-    'deny-prod':   re.compile(r'matches a production pattern'),
-    'ask-unknown': re.compile(r'matches neither a production'),
-    'ask-ambient': re.compile(r'shared mutable state that a parallel session'),
-    'ask-switch':  re.compile(r'is shared by every session'),
+    'deny-prod':    re.compile(r'matches a production pattern'),
+    'ask-unknown':  re.compile(r'matches neither a production'),
+    'deny-ambient': re.compile(r'shared mutable state that a parallel session'),
+    'ask-switch':   re.compile(r'is shared by every session'),
 }
 
 # One-line hint per category: what the user does to stop the prompt.
 CATEGORY_HINT = {
-    'deny-prod':   'intended block (prefix PROD_GUARD_OVERRIDE=<reason> only if truly intentional)',
-    'ask-unknown': 'add a vetted nonprod pattern for the target to .claude/prod-guard.json',
-    'ask-ambient': 'pin the target explicitly (--context/--project/--profile/…)',
-    'ask-switch':  'pin per-command instead of switching shared state',
+    'deny-prod':    'intended block (prefix PROD_GUARD_OVERRIDE=<reason> only if truly intentional)',
+    'ask-unknown':  'add a vetted nonprod pattern for the target to .claude/prod-guard.json',
+    'deny-ambient': 'pin the target explicitly (--context/--project/--profile/…) — the deny self-heals once pinned',
+    'ask-switch':   'pin per-command instead of switching shared state',
 }
 
 # A deny downgraded by PROD_GUARD_OVERRIDE keeps its deny-prod signature but is

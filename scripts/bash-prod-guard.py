@@ -28,8 +28,10 @@ Decision semantics (per simple command; worst verdict wins across a chain):
     downgradable to `ask` with a `PROD_GUARD_OVERRIDE=<reason>` prefix.
   * mutating verb + explicit target that matches no pattern     -> **ask**
     (fail CLOSED on the security decision: unknown is never silently allowed).
-  * mutating verb + no explicit target (ambient context)        -> **ask**
-    (deny if the ambient value itself classifies PROD).
+  * mutating verb + no explicit target (ambient context)        -> **deny**
+    with a self-healing fix-it (add the pin flag and retry): the ambient
+    target is clobber-prone shared state, so the command cannot run until the
+    target is explicit. Downgradable to `ask` with `PROD_GUARD_OVERRIDE`.
   * context-switching commands (`kubectl config use-context`, `kubectx`,
     `docker context use`, `gcloud config set`, `az account set`, ...) -> **ask**
     (deny when the new target classifies PROD): they mutate the very shared
@@ -898,11 +900,14 @@ def ask_unknown(action, target_desc):
             % (action, target_desc, CONFIG_HINT))
 
 
-def ask_ambient(action, ambient_desc, pin_hint):
-    return (ASK,
+def deny_ambient(action, ambient_desc, pin_hint):
+    return (DENY,
             'prod-guard: `%s` relies on %s — shared mutable state that a '
-            'parallel session can repoint before this command runs. Pin the '
-            'target explicitly (%s) to make the command unambiguous.'
+            'parallel session can repoint before this command runs, so the '
+            'true target is ambiguous at run time. Mutating commands must pin '
+            'their target explicitly: add %s and retry. To run against the '
+            'ambient target anyway, prefix the command with '
+            'PROD_GUARD_OVERRIDE=<reason> for a confirmation prompt.'
             % (action, ambient_desc, pin_hint))
 
 
@@ -932,8 +937,8 @@ def policy(action, explicit_value, explicit_desc,
     if ambient_value is not None:
         if classify_fn(ambient_value) == 'prod':
             return deny_prod(action, ambient_desc + ' (ambient)')
-        return ask_ambient(action, ambient_desc, pin_hint)
-    return ask_ambient(action, ambient_desc, pin_hint)
+        return deny_ambient(action, ambient_desc, pin_hint)
+    return deny_ambient(action, ambient_desc, pin_hint)
 
 
 # ---------------------------------------------------------------------------
@@ -1079,15 +1084,21 @@ def _scan_verb(tokens, mutating_exact=frozenset(), mutating_prefixes=(),
 
 def _kube_target(argv, seg_env, context_flags):
     """(explicit_value, explicit_desc, ambient_value, ambient_desc) for a
-    kubeconfig-based tool."""
+    kubeconfig-based tool. The desc names the resolved context and, when an
+    explicit `-n`/`--namespace` is present, the namespace the mutation lands in
+    — so the deny/ask prompt always displays where it goes (issue #10)."""
+    ns = first_flag_value(argv, ('-n', '--namespace'))
+    ns_suffix = ("; namespace '%s'" % ns) if ns else ''
     ctx = first_flag_value(argv, context_flags)
     if ctx is not None:
-        return ctx, "kube-context '%s' (from %s)" % (ctx, context_flags[0]), None, ''
+        return (ctx, "kube-context '%s' (from %s%s)"
+                % (ctx, context_flags[0], ns_suffix), None, '')
     ambient = kube_current_context(seg_env)
     if ambient is not None:
-        desc = "the ambient kube-context (currently '%s')" % ambient
+        desc = "the ambient kube-context (currently '%s'%s)" % (ambient, ns_suffix)
     else:
-        desc = 'the ambient kube-context (unresolvable at hook time)'
+        desc = ('the ambient kube-context (unresolvable at hook time%s)'
+                % ns_suffix)
     return None, '', ambient, desc
 
 
@@ -1231,7 +1242,7 @@ def eval_gcloud(argv, seg_env, ctx):
         return [deny_prod(action, "the active gcloud config project '%s' (ambient)" % ambient)]
     desc = ("the ambient gcloud active configuration (project '%s')" % ambient
             if ambient else 'the ambient gcloud active configuration (unresolvable at hook time)')
-    return [ask_ambient(action, desc, 'gcloud --project <id>')]
+    return [deny_ambient(action, desc, 'gcloud --project <id>')]
 
 
 def ambient_aws_default_profile_decision(action, seg_env, pin,
@@ -1255,8 +1266,8 @@ def ambient_aws_default_profile_decision(action, seg_env, pin,
             if classify(v) == 'prod':
                 return deny_prod(action, 'the default aws profile (ambient)')
         if named:
-            return ask_ambient(action, named_desc % named[0], pin)
-    return ask_ambient(action, generic_desc, pin)
+            return deny_ambient(action, named_desc % named[0], pin)
+    return deny_ambient(action, generic_desc, pin)
 
 
 def eval_aws(argv, seg_env, ctx):
@@ -1337,7 +1348,7 @@ def eval_az(argv, seg_env, ctx):
         return [deny_prod(action, "the active azure subscription '%s' (ambient)" % ambient)]
     desc = ("the ambient azure subscription (currently '%s')" % ambient
             if ambient else 'the ambient azure subscription (unresolvable at hook time)')
-    return [ask_ambient(action, desc, 'az --subscription <id>')]
+    return [deny_ambient(action, desc, 'az --subscription <id>')]
 
 
 def eval_terraform(argv, seg_env, ctx):
@@ -1387,7 +1398,7 @@ def eval_terraform(argv, seg_env, ctx):
         return [deny_prod(action, backend)]
     desc = ("the selected terraform workspace ('%s') and its backend" % ambient
             if ambient else 'an unresolved terraform workspace/backend')
-    return [ask_ambient(action, desc, 'TF_WORKSPACE=<workspace> terraform ...')]
+    return [deny_ambient(action, desc, 'TF_WORKSPACE=<workspace> terraform ...')]
 
 
 # Docker context names that mean "the local daemon" — mutating the local
@@ -1481,7 +1492,7 @@ def eval_docker(argv, seg_env, ctx):
         return [deny_prod(action, "the ambient docker context '%s'" % ambient)]
     if cls == 'nonprod':
         return []
-    return [ask_ambient(action, "the ambient docker context ('%s')" % ambient,
+    return [deny_ambient(action, "the ambient docker context ('%s')" % ambient,
                         'docker --context <ctx>')]
 
 
@@ -1614,7 +1625,7 @@ def eval_argocd(argv, seg_env, ctx):
         return [deny_prod(action, "the ambient argocd context '%s'" % ambient)]
     desc = ("the ambient argocd context ('%s')" % ambient
             if ambient else 'the ambient argocd context (unresolvable at hook time)')
-    return [ask_ambient(action, desc, 'argocd --server <host>')]
+    return [deny_ambient(action, desc, 'argocd --server <host>')]
 
 
 def eval_eksctl(argv, seg_env, ctx):
@@ -1665,7 +1676,7 @@ def eval_doctl(argv, seg_env, ctx):
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "doctl context '%s'" % ctx_name)]
-    return [ask_ambient(action, 'the ambient doctl auth context',
+    return [deny_ambient(action, 'the ambient doctl auth context',
                         'doctl --context <name>')]
 
 
@@ -1702,7 +1713,7 @@ def _pulumi_decide(action, explicit, seg_env, ctx):
         return [deny_prod(action, "the selected pulumi stack '%s' (ambient)" % ambient)]
     desc = ("the ambient selected pulumi stack (currently '%s')" % ambient
             if ambient else 'the ambient selected pulumi stack (unresolved at hook time)')
-    return [ask_ambient(action, desc, 'pulumi --stack <name>')]
+    return [deny_ambient(action, desc, 'pulumi --stack <name>')]
 
 
 def eval_pulumi(argv, seg_env, ctx):
@@ -1837,7 +1848,7 @@ def eval_ansible(argv, seg_env, ctx):
             return [deny_prod(action, "the ambient ansible inventory '%s'" % ambient)]
         if cls == 'nonprod':
             return []
-    return [ask_ambient(action, 'the ambient ansible inventory '
+    return [deny_ambient(action, 'the ambient ansible inventory '
                         '(ANSIBLE_INVENTORY / ansible.cfg / /etc/ansible/hosts)',
                         '-i <inventory>')]
 
