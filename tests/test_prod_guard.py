@@ -17,6 +17,7 @@ Fixture rule: never use real production names or real credentials paths in
 fixtures. Synthetic names (`gke_acme_prod-us`, `kind-ci`, `bluefin`) exercise
 identical code paths with zero risk.
 """
+import hashlib
 import json
 import os
 import subprocess
@@ -108,6 +109,26 @@ def make_home(kubeconfig=None, gcloud_project=None, docker_context=None,
         with open(os.path.join(adir, "config"), "w", encoding="utf-8") as f:
             f.write("current-context: %s\n" % argocd_context)
     return home
+
+
+def pulumi_workspace_path(home, cwd, name, ext=".yaml", pulumi_home=None):
+    """Write a `Pulumi<ext>` project file (project name `name`) in `cwd` and
+    return the path where pulumi would keep this project's workspace settings —
+    `<pulumi_home or home/.pulumi>/workspaces/<name>-<sha1(projpath)>-workspace.json`,
+    keyed exactly as pulumi keys it (sha1 hex of the absolute project-file
+    path). The caller writes the `{"stack": ...}` body (or nothing, to model an
+    unselected/absent workspace) and passes `cwd` to run_hook."""
+    proj_path = os.path.join(os.path.abspath(cwd), "Pulumi" + ext)
+    with open(proj_path, "w", encoding="utf-8") as f:
+        if ext == ".json":
+            json.dump({"name": name, "runtime": "nodejs"}, f)
+        else:
+            f.write("name: %s\nruntime: nodejs\n" % name)
+    ws_dir = os.path.join(pulumi_home or os.path.join(home, ".pulumi"),
+                          "workspaces")
+    os.makedirs(ws_dir, exist_ok=True)
+    digest = hashlib.sha1(proj_path.encode("utf-8")).hexdigest()
+    return os.path.join(ws_dir, "%s-%s-workspace.json" % (name, digest))
 
 
 def run_hook(command, home=None, env_extra=None, cwd=None,
@@ -1137,7 +1158,8 @@ class EksctlDoctlTests(unittest.TestCase):
 
 class PulumiTests(unittest.TestCase):
     """Q4: pulumi targets the stack. Explicit --stack/-s is classified; no
-    stack pinned prompts (ambient selected stack is not read from disk)."""
+    stack pinned resolves the per-project selected stack from disk (Q8) — a
+    prod selection denies, anything else keeps the ambient prompt."""
 
     def test_up_prod_stack_denied(self):
         decision, reason = run_hook("pulumi up --stack acme/prod --yes")
@@ -1204,6 +1226,105 @@ class PulumiTests(unittest.TestCase):
     def test_refresh_prod_denied(self):
         decision, _ = run_hook("pulumi refresh -s prod --yes")
         self.assertEqual(decision, "deny")
+
+    # --- Q8: ambient selected-stack resolution from ~/.pulumi/workspaces ---
+
+    def test_ambient_prod_selection_denied(self):
+        home = make_home()
+        cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
+        wfile = pulumi_workspace_path(home, cwd, "myproj")
+        with open(wfile, "w", encoding="utf-8") as f:
+            json.dump({"stack": "acme/prod"}, f)
+        decision, reason = run_hook("pulumi up --yes", home=home, cwd=cwd)
+        self.assertEqual(decision, "deny")
+        self.assertIn("selected pulumi stack", reason)
+        self.assertIn("acme/prod", reason)
+
+    def test_ambient_nonprod_selection_still_asks(self):
+        # Additive: a nonprod selection does NOT defer — the per-project
+        # selection is clobber-prone shared state, so it still prompts.
+        home = make_home()
+        cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
+        wfile = pulumi_workspace_path(home, cwd, "myproj")
+        with open(wfile, "w", encoding="utf-8") as f:
+            json.dump({"stack": "dev"}, f)
+        decision, reason = run_hook("pulumi up --yes", home=home, cwd=cwd)
+        self.assertEqual(decision, "ask")
+        self.assertIn("dev", reason)
+
+    def test_ambient_pulumi_home_override_honored(self):
+        home = make_home()
+        cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
+        phome = tempfile.mkdtemp(prefix="prod-guard-pulumi-home-")
+        wfile = pulumi_workspace_path(home, cwd, "myproj", pulumi_home=phome)
+        with open(wfile, "w", encoding="utf-8") as f:
+            json.dump({"stack": "acme/prod"}, f)
+        decision, _ = run_hook("pulumi destroy --yes", home=home, cwd=cwd,
+                               env_extra={"PULUMI_HOME": phome})
+        self.assertEqual(decision, "deny")
+
+    def test_ambient_json_project_prod_selection_denied(self):
+        # The project name is read from a Pulumi.json project file too.
+        home = make_home()
+        cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
+        wfile = pulumi_workspace_path(home, cwd, "jsproj", ext=".json")
+        with open(wfile, "w", encoding="utf-8") as f:
+            json.dump({"stack": "prod-eu"}, f)
+        decision, _ = run_hook("pulumi up --yes", home=home, cwd=cwd)
+        self.assertEqual(decision, "deny")
+
+    def test_explicit_stack_beats_prod_selection(self):
+        # An explicit --stack wins; the on-disk prod selection is never read.
+        home = make_home()
+        cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
+        wfile = pulumi_workspace_path(home, cwd, "myproj")
+        with open(wfile, "w", encoding="utf-8") as f:
+            json.dump({"stack": "acme/prod"}, f)
+        decision, _ = run_hook("pulumi up --stack dev --yes", home=home, cwd=cwd)
+        self.assertIsNone(decision)
+
+    def test_no_stack_key_asks(self):
+        # A workspace file with no selection recorded -> unresolved -> ask.
+        home = make_home()
+        cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
+        wfile = pulumi_workspace_path(home, cwd, "myproj")
+        with open(wfile, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        decision, reason = run_hook("pulumi up --yes", home=home, cwd=cwd)
+        self.assertEqual(decision, "ask")
+        self.assertIn("--stack", reason)
+
+    def test_malformed_workspace_json_fails_open_to_ask(self):
+        home = make_home()
+        cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
+        wfile = pulumi_workspace_path(home, cwd, "myproj")
+        with open(wfile, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        decision, _ = run_hook("pulumi up --yes", home=home, cwd=cwd)
+        self.assertEqual(decision, "ask")
+
+    def test_ambient_walk_up_to_parent_project(self):
+        # pulumi finds the nearest Pulumi.yaml walking UP from cwd; the
+        # workspace key hashes that parent project path.
+        home = make_home()
+        parent = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
+        sub = os.path.join(parent, "infra", "sub")
+        os.makedirs(sub)
+        wfile = pulumi_workspace_path(home, parent, "myproj")
+        with open(wfile, "w", encoding="utf-8") as f:
+            json.dump({"stack": "acme/prod"}, f)
+        decision, _ = run_hook("pulumi up --yes", home=home, cwd=sub)
+        self.assertEqual(decision, "deny")
+
+    def test_ambient_prod_selection_readonly_verb_defers(self):
+        # A prod selection is irrelevant to a read-only verb.
+        home = make_home()
+        cwd = tempfile.mkdtemp(prefix="prod-guard-pulumi-")
+        wfile = pulumi_workspace_path(home, cwd, "myproj")
+        with open(wfile, "w", encoding="utf-8") as f:
+            json.dump({"stack": "acme/prod"}, f)
+        decision, _ = run_hook("pulumi preview", home=home, cwd=cwd)
+        self.assertIsNone(decision)
 
 
 class AnsibleTests(unittest.TestCase):
