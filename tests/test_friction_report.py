@@ -48,11 +48,13 @@ REASON_ASK_UNKNOWN = (
     "never silently allowed. Confirm it is safe, or add a nonprod pattern to "
     ".claude/prod-guard.json to classify it. Patterns: built-ins plus "
     ".claude/prod-guard.json (see the prod-guard README).")
-REASON_ASK_AMBIENT = (
+REASON_DENY_AMBIENT = (
     "prod-guard: `kubectl apply` relies on the ambient kube-context (currently "
     "'staging-west') — shared mutable state that a parallel session can repoint "
-    "before this command runs. Pin the target explicitly (kubectl --context "
-    "<ctx>) to make the command unambiguous.")
+    "before this command runs, so the true target is ambiguous at run time. "
+    "Mutating commands must pin their target explicitly: add kubectl --context "
+    "<ctx> and retry. To run against the ambient target anyway, prefix the "
+    "command with PROD_GUARD_OVERRIDE=<reason> for a confirmation prompt.")
 REASON_ASK_SWITCH = (
     "prod-guard: `kubectx bluefin` repoints the shared kubeconfig "
     "current-context, which is shared by every session on this machine — "
@@ -142,7 +144,7 @@ class CategoryTests(unittest.TestCase):
     def test_each_builder(self):
         self.assertEqual(fr.category_of(REASON_DENY_PROD), "deny-prod")
         self.assertEqual(fr.category_of(REASON_ASK_UNKNOWN), "ask-unknown")
-        self.assertEqual(fr.category_of(REASON_ASK_AMBIENT), "ask-ambient")
+        self.assertEqual(fr.category_of(REASON_DENY_AMBIENT), "deny-ambient")
         self.assertEqual(fr.category_of(REASON_ASK_SWITCH), "ask-switch")
 
     def test_unmatched_is_other(self):
@@ -209,12 +211,12 @@ class BuildReportTests(unittest.TestCase):
         self.assertEqual(r["decisions"]["ask"], 1)
 
     def test_joined_reason_hits_both_categories(self):
-        joined = REASON_ASK_AMBIENT + " | " + REASON_ASK_SWITCH
+        joined = REASON_DENY_AMBIENT + " | " + REASON_ASK_SWITCH
         r = self._report([
-            {"plugin": "prod-guard", "decision": "ask", "reason": joined,
+            {"plugin": "prod-guard", "decision": "deny", "reason": joined,
              "command": "kubectl apply -f x"},
         ])
-        self.assertEqual(r["categories"]["ask-ambient"], 1)
+        self.assertEqual(r["categories"]["deny-ambient"], 1)
         self.assertEqual(r["categories"]["ask-switch"], 1)
 
     def test_tool_breakdown(self):

@@ -19,9 +19,11 @@ infrastructure command will actually land — the explicit `--context` /
 `--project` / `--profile` flag if present, otherwise the tool's ambient
 config — classifies that target against configurable patterns, and:
 
-- **blocks** mutating commands aimed at a **production** target;
-- **prompts** for mutating commands whose target is **unknown** or comes
-  from **shared ambient state** a parallel session can silently repoint;
+- **blocks** mutating commands aimed at a **production** target, and mutating
+  commands that don't pin their target at all — relying on **shared ambient
+  state** a parallel session can silently repoint — with a fix-it that tells
+  the agent which flag to add;
+- **prompts** for mutating commands whose explicit target is **unknown**;
 - **stays silent** for everything else, so your normal permissions apply.
 
 ## Contents
@@ -56,8 +58,13 @@ target relies on shared mutable state: the kubeconfig `current-context`, the
 active gcloud configuration, the docker context, the default AWS profile.
 When several Claude Code sessions run in parallel — increasingly the normal
 way to work — any of them can repoint that state between the moment a command
-is written and the moment it runs. prod-guard prompts (`ask`) on these and
-tells the agent which flag pins the target.
+is written and the moment it runs. prod-guard **denies** these with a
+self-healing fix-it (`deny`) that names the resolved target and the flag to
+add: the command can't run until the target is explicit, and the agent
+self-corrects in one round trip by adding `--context`/`--project`/… and
+retrying. A `deny` beats an `ask` here because it's machine-actionable — it
+doesn't stall waiting on a human, and it makes the [override](#the-override-escape-hatch)
+available if pinning genuinely isn't possible.
 
 ## What it does
 
@@ -66,13 +73,16 @@ across `&&`/`|`/`;`/`$( )` chains):
 
 - **deny** — the command is blocked with a reason naming the resolved target
   and the override. This is the outcome for *mutating verb + production
-  target*, however the target was resolved (explicit flag or ambient state).
+  target*, however the target was resolved (explicit flag or ambient state),
+  and for *mutating verb + no explicit target at all* (the clobbering risk) —
+  the latter with a fix-it naming the flag to add, so the agent re-runs
+  pinned instead of stalling a human.
 - **ask** — Claude Code shows its standard permission prompt. This is the
-  outcome for *mutating verb + unknown target* (fail closed: unknown is never
-  silently allowed) and *mutating verb + ambient target* (the clobbering
-  risk), and for commands that repoint shared state itself (`kubectl config
-  use-context`, `kubectx`, `gcloud config set`, `az account set`,
-  `docker context use`, `aws configure`, …).
+  outcome for *mutating verb + unknown explicit target* (fail closed: unknown
+  is never silently allowed), and for commands that repoint shared state
+  itself (`kubectl config use-context`, `kubectx`, `gcloud config set`,
+  `az account set`, `docker context use`, `aws configure`, …) — which have no
+  target to pin.
 - **defer** — the hook stays silent; your normal permission settings apply.
   This is the outcome for read-only verbs, non-production targets, and
   uncovered tools. prod-guard never emits `allow`, so it composes with other
@@ -97,15 +107,15 @@ across `&&`/`|`/`;`/`$( )` chains):
 | `ssh dev-box uptime` | defer |
 | `pulumi up --stack acme/prod` | **deny** |
 | `pulumi up` (no stack; selected stack is `acme/prod`) | **deny** |
-| `pulumi up` (no stack pinned, selection unresolved) | **ask** |
+| `pulumi up` (no stack pinned, selection unresolved) | **deny** (pin `--stack`) |
 | `ansible-playbook -i inventories/prod site.yml` | **deny** |
 | `ansible prod-db -m ping` (read-only module) | defer |
 | `echo done && kubectl --context prod-us delete ns x` | **deny** |
 | `bash -c 'kubectl --context prod-us delete ns x'` | **deny** |
-| `kubectl delete pod x` (ambient kind context) | **ask** |
+| `kubectl delete pod x` (ambient kind context, no `--context`) | **deny** (pin `--context`) |
 | `kubectl --context bluefin apply -f m.yaml` (unclassified) | **ask** |
-| `terraform apply` (no workspace pinned) | **ask** |
-| `aws s3 rm s3://bucket/key` (no profile pinned) | **ask** |
+| `terraform apply` (no workspace pinned) | **deny** (pin `TF_WORKSPACE`) |
+| `aws s3 rm s3://bucket/key` (no profile pinned) | **deny** (pin `--profile`) |
 | `aws ec2 terminate-instances …` (default profile → prod SSO account) | **deny** |
 | `aws s3 rm … --profile admin` (`[profile admin]` → prod SSO account) | **deny** |
 | `kubectl config use-context kind-ci` | **ask** |
@@ -164,24 +174,24 @@ installed version against the
 For each tool the guard knows the **explicit target flag**, the **ambient
 state** consulted when the flag is absent, and which verbs mutate. Verbs the
 tables have never heard of are treated as **mutating** — when unsure, the
-guard errs toward a prompt, because a missed destructive form is the failure
-mode that matters.
+guard errs toward friction (a prompt, or a deny when the target isn't pinned),
+because a missed destructive form is the failure mode that matters.
 
 | Tool | Explicit target | Ambient fallback |
 | --- | --- | --- |
 | `kubectl`, `oc`, `flux` | `--context` | `current-context` in `$KUBECONFIG` / `~/.kube/config`; `oc login` / `oc project` prompt as kubeconfig writers. A context resolves to its cluster's `server:` URL in the kubeconfig, which is classified alongside the context name — so a prod cluster reached through an innocuously named context is still denied |
 | `helm` | `--kube-context` | same kubeconfig `current-context` |
 | `gcloud` | `--project` / `--zone` / `--region` / `--account`, `CLOUDSDK_CORE_PROJECT` | project of the active gcloud configuration |
-| `aws` | `--profile` / `--region`, `AWS_PROFILE`. An unknown-named profile is resolved to its `[profile NAME]` account (`sso_start_url` / `role_arn` / `sso_session`) in `~/.aws/config`, so a prod account behind an innocuous name still denies | the `[default]` profile's `sso_start_url` / `role_arn` / `sso_session` in `~/.aws/config` (or `$AWS_CONFIG_FILE`) — a prod account denies, otherwise prompts |
-| `eksctl` | `--profile` / `--region`, `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | the `[default]` profile in `~/.aws/config`, resolved exactly as for `aws` — a prod account denies, otherwise prompts |
+| `aws` | `--profile` / `--region`, `AWS_PROFILE`. An unknown-named profile is resolved to its `[profile NAME]` account (`sso_start_url` / `role_arn` / `sso_session`) in `~/.aws/config`, so a prod account behind an innocuous name still denies | the `[default]` profile's `sso_start_url` / `role_arn` / `sso_session` in `~/.aws/config` (or `$AWS_CONFIG_FILE`) — a prod account denies; an unpinned mutation denies with a pin-`--profile` fix-it either way, naming what resolved |
+| `eksctl` | `--profile` / `--region`, `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` | the `[default]` profile in `~/.aws/config`, resolved exactly as for `aws` — a prod account denies; an unpinned mutation denies (pin `--profile`) |
 | `az` | `--subscription` | default subscription in `~/.azure/azureProfile.json` |
 | `terraform` / `tofu` | `TF_WORKSPACE` | `.terraform/environment` in the working dir; the initialized backend's state location (S3/GCS bucket, Terraform Cloud org/workspace) from `.terraform/terraform.tfstate` is classified too, so a prod state location denies even behind an innocuous workspace name; `apply`/`destroy` are always treated as mutating |
 | `docker`, `podman`, `nerdctl`, `docker-compose` | `--context` / `--connection`, `DOCKER_HOST` / `CONTAINER_HOST` | `currentContext` in `~/.docker/config.json`; a local-daemon context defers. `docker push` classifies the image ref's registry; `build --push` classifies **every** `-t` tag; `compose push` fails closed (the registry lives in the compose file, which the hook doesn't parse) |
 | `gh` | `-R`/`--repo`, `GH_REPO` | the cwd repo's `origin` remote (denylist-only — see [Limitations](#limitations)) |
 | `ssh` | destination host (`user@host`, `-J` jump host) | n/a — denylist-only: a prod destination is denied, everything else defers (see [Limitations](#limitations)) |
 | `argocd` | `--server` | `current-context` in `~/.config/argocd/config` |
-| `doctl` | `--context` | the doctl auth context (never read — always prompts) |
-| `pulumi` | `--stack` / `-s` | the per-project selected stack, read from `~/.pulumi/workspaces/` (a prod selection denies; otherwise prompts); `pulumi stack select` prompts (denies for a prod stack) |
+| `doctl` | `--context` | the doctl auth context (never read — an unpinned mutation denies, pin `--context`) |
+| `pulumi` | `--stack` / `-s` | the per-project selected stack, read from `~/.pulumi/workspaces/` (a prod selection denies; an unpinned mutation denies either way, pin `--stack`); `pulumi stack select` prompts (denies for a prod stack) |
 | `ansible`, `ansible-playbook` | `-i` / `--inventory`, `--limit`, and (ad-hoc) the host pattern | `ANSIBLE_INVENTORY`, then `[defaults] inventory` in `ansible.cfg`. The inventory is the target; `--limit`/pattern can only *escalate* to a prod deny. `--syntax-check`/`--list-hosts`/`--list-tasks`/`--list-tags` and ad-hoc `-m ping`/`setup`/`debug` are read-only |
 | `kubectx` / `kubens` | n/a | switching contexts/namespaces *is* the shared-state mutation; prompts (denies for a prod context) |
 | `kustomize` | n/a | local-only tool; always defers (the `kubectl apply` it pipes into is guarded separately) |
@@ -264,16 +274,19 @@ avoids the prompts instead of triggering them:
 ## Avoiding prod-guard permission prompts
 
 This machine uses prod-guard, a hook that blocks mutating infrastructure
-commands aimed at production and prompts when a mutating command relies on
-ambient context. To keep work flowing:
+commands aimed at production, and denies a mutating command that doesn't pin
+its target (relying on clobber-prone ambient context) with a fix-it naming the
+flag to add. To keep work flowing:
 
 - **Pin the target on every mutating command**: `kubectl --context <ctx>`,
   `helm --kube-context <ctx>`, `gcloud --project <id>`,
   `aws --profile <name>`, `az --subscription <id>`,
   `TF_WORKSPACE=<ws> terraform ...`, `docker --context <ctx>`,
-  `pulumi --stack <name>`, `ansible-playbook -i <inventory>`. Relying on
-  the current context/config prompts every time — a parallel session can
-  repoint it.
+  `pulumi --stack <name>`, `ansible-playbook -i <inventory>`. A mutating
+  command that relies on the current context/config is **denied** — the deny
+  names the flag to add, so just re-run with it pinned. (A parallel session
+  can repoint that shared state between writing the command and running it,
+  which is why an explicit target is required.)
 - **Don't switch shared context** (`kubectl config use-context`, `kubectx`,
   `gcloud config set project`, `az account set`, `docker context use`) —
   that repoints every parallel session. Pin per command instead.
@@ -299,7 +312,7 @@ targets prompt over and over — run the friction report:
 It is a **read-only** analyzer: it re-reads the decisions Claude Code already
 recorded in your local session transcripts and adds no telemetry (see
 [PRIVACY.md](PRIVACY.md)). The report ranks prompts by category (`deny-prod`,
-`ask-unknown`, `ask-ambient`, `ask-switch`), by tool, and — most usefully — by
+`deny-ambient`, `ask-unknown`, `ask-switch`), by tool, and — most usefully — by
 **unclassified target**: the non-prod names that keep landing in `ask-unknown`
 are exactly the ones to add under `"nonprod"` in `.claude/prod-guard.json` (see
 [Configuration](#configuration)). Vet each before adding — never reclassify a
@@ -338,17 +351,18 @@ python3 scripts/friction-report.py --since 30d --repo gateway --top 20
   radius, and a read-only remote command can't be distinguished from a
   destructive one.
 - The doctl auth context is not read from disk; a mutating command relying on
-  it always prompts rather than resolving the ambient value.
+  it is denied (pin `--context`) rather than resolving the ambient value.
 - pulumi's selected stack is read from `~/.pulumi/workspaces/` (or `$PULUMI_HOME`)
   to deny an ambient prod selection. Recent pulumi can relocate that directory in
   "agent mode" when `~/.pulumi` isn't writable and no `PULUMI_HOME` is set; the
-  guard doesn't follow that relocation, so the file simply isn't found and the
-  command prompts (fail-open) rather than resolving. `pulumi stack select <prod>`
-  is still denied regardless.
+  guard doesn't follow that relocation, so the file simply isn't found and an
+  unpinned mutation is denied with a pin-`--stack` fix-it (fail-open on the
+  read still lands on the unpinned deny) rather than resolving the selection.
+  `pulumi stack select <prod>` is still denied regardless.
 - Ambient state is read at *hook* time; a race remains between the hook's
   check and the command's execution. Pinning the target with a flag — which
-  the ask message steers toward — is the real fix; the prompt exists to
-  force that choice.
+  the unpinned-mutation deny steers toward — is the real fix; the deny exists
+  to force that choice before the command can run.
 - Command parsing is intentionally conservative: an operator inside a quoted
   string can split a segment and produce a spurious prompt (never a missed
   one). Heredoc bodies mentioning covered tools may likewise prompt.
