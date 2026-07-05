@@ -49,6 +49,7 @@ cluster call.
 
 Reads the hook JSON on stdin, emits a PreToolUse decision on stdout.
 """
+import hashlib
 import json
 import os
 import re
@@ -781,6 +782,92 @@ def terraform_backend_prod(cwd):
         if classify(val) == 'prod':
             return "the terraform %s backend" % btype
     return None
+
+
+def _pulumi_home_dir(seg_env):
+    """`$PULUMI_HOME` (segment env then process env), else `~/.pulumi`. None
+    when neither is resolvable (no $HOME)."""
+    home = seg_env.get('PULUMI_HOME') or os.environ.get('PULUMI_HOME')
+    if home:
+        return home
+    h = os.environ.get('HOME')
+    if h:
+        return os.path.join(h, '.pulumi')
+    return None
+
+
+# Project-file extensions in pulumi's `encoding.Exts` order — the first one that
+# exists in a directory is THE project file, and its absolute path is the string
+# pulumi sha1-hashes to key the workspace file. Order matters: `.json` wins.
+_PULUMI_PROJECT_EXTS = ('.json', '.yaml', '.yml')
+
+
+def _pulumi_project_name(path, ext):
+    """The `name` field of a pulumi project file. JSON: the top-level `name`
+    key. YAML: the first top-level `name:` scalar (quotes/inline-comment
+    stripped, block maps skipped). None if unreadable or unnamed — fail OPEN."""
+    try:
+        if ext == '.json':
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                name = data.get('name')
+                return name if isinstance(name, str) and name else None
+            return None
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                m = re.match(r'^name:\s*["\']?([^"\'\n#]+)', line)
+                if m:
+                    return m.group(1).strip() or None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _pulumi_find_project(cwd):
+    """(projectpath, name) for the nearest `Pulumi.{json,yaml,yml}` at or above
+    cwd — pulumi's `DetectProjectPathFrom`, walking up and stopping at the first
+    directory that holds a project file (extensions tried in `encoding.Exts`
+    order). `projectpath` is the absolute, cleaned path pulumi hashes. None when
+    no project file is found or its name can't be read (fail OPEN)."""
+    d = os.path.abspath(cwd or '.')
+    while True:
+        for ext in _PULUMI_PROJECT_EXTS:
+            p = os.path.join(d, 'Pulumi' + ext)
+            if os.path.isfile(p):
+                name = _pulumi_project_name(p, ext)
+                return (p, name) if name else None
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def pulumi_selected_stack(seg_env, cwd):
+    """The currently-selected stack for the project at cwd, read from pulumi's
+    per-project workspace settings file
+    `<home>/workspaces/<name>-<sha1hex(projectpath)>-workspace.json` (`stack`
+    field). None when there is no project, no workspace file, or no selection
+    recorded. Pure local read; fail OPEN on any error."""
+    phome = _pulumi_home_dir(seg_env)
+    if not phome:
+        return None
+    found = _pulumi_find_project(cwd)
+    if not found:
+        return None
+    path, name = found
+    digest = hashlib.sha1(path.encode('utf-8')).hexdigest()  # noqa: S324
+    wfile = os.path.join(phome, 'workspaces',
+                         '%s-%s-workspace.json' % (name, digest))
+    try:
+        with open(wfile, encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    stack = data.get('stack')
+    return stack if isinstance(stack, str) and stack else None
 
 
 # ---------------------------------------------------------------------------
@@ -1597,10 +1684,12 @@ PULUMI_VALUE_FLAGS = (
 )
 
 
-def _pulumi_decide(action, explicit):
+def _pulumi_decide(action, explicit, seg_env, ctx):
     """Classify an explicit pulumi stack (flag or positional); no stack pinned
-    -> ask_ambient. The ambient selected stack is not read from disk in v1
-    (see the pulumi-ansible-coverage plan doc)."""
+    -> resolve the per-project selected stack from disk. A prod selection denies
+    (ambient); nonprod/unknown/unresolved keep the ambient ask — the selection
+    is clobber-prone shared state, so only prod escalates (additive; see the
+    pulumi-ambient-stack plan doc)."""
     if explicit is not None:
         cls = classify(explicit)
         if cls == 'prod':
@@ -1608,8 +1697,12 @@ def _pulumi_decide(action, explicit):
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "pulumi stack '%s'" % explicit)]
-    return [ask_ambient(action, 'the ambient selected pulumi stack '
-                        '(unresolved at hook time)', 'pulumi --stack <name>')]
+    ambient = pulumi_selected_stack(seg_env, ctx.get('cwd'))
+    if ambient is not None and classify(ambient) == 'prod':
+        return [deny_prod(action, "the selected pulumi stack '%s' (ambient)" % ambient)]
+    desc = ("the ambient selected pulumi stack (currently '%s')" % ambient
+            if ambient else 'the ambient selected pulumi stack (unresolved at hook time)')
+    return [ask_ambient(action, desc, 'pulumi --stack <name>')]
 
 
 def eval_pulumi(argv, seg_env, ctx):
@@ -1630,13 +1723,14 @@ def eval_pulumi(argv, seg_env, ctx):
                 return [deny_prod(action, "pulumi stack '%s'" % name)]
             return [ask_switch(action, 'the selected pulumi stack')]
         # init/rm/rename/tag/import/change-secrets-provider: mutate the stack.
-        return _pulumi_decide(action, name)
+        return _pulumi_decide(action, name, seg_env, ctx)
     if verb == 'config':
         sub = words[1].lower() if len(words) > 1 else None
         if sub is None or sub == 'get':
             return []
         # set/rm/set-all/rm-all/cp/refresh: mutate the selected stack's config.
-    return _pulumi_decide(action, first_flag_value(argv, ('--stack', '-s')))
+    return _pulumi_decide(action, first_flag_value(argv, ('--stack', '-s')),
+                          seg_env, ctx)
 
 
 # ansible ad-hoc modules that only read remote state (no change).

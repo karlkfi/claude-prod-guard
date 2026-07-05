@@ -24,4 +24,4 @@ Specific actionable items in priority order. Pick from the top; skip 🚫 items 
 
 | ID | Item | Labels | St | Sz | Notes |
 |---|---|---|---|---|---|
-| <a id="Q8"></a>Q8 | Read pulumi's ambient selected stack from `~/.pulumi/workspaces/` for ambient classification | `security` | 💤 | M | Today a mutating `pulumi` command with no `--stack` always asks; resolving the selected stack (keyed by a hash of the `Pulumi.yaml` path) would let ambient-prod deny. |
+| _(empty)_ | | | | | |

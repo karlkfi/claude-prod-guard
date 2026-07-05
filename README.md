@@ -96,7 +96,8 @@ across `&&`/`|`/`;`/`$( )` chains):
 | `ssh deploy@prod-web-1 uptime` | **deny** |
 | `ssh dev-box uptime` | defer |
 | `pulumi up --stack acme/prod` | **deny** |
-| `pulumi up` (no stack pinned) | **ask** |
+| `pulumi up` (no stack; selected stack is `acme/prod`) | **deny** |
+| `pulumi up` (no stack pinned, selection unresolved) | **ask** |
 | `ansible-playbook -i inventories/prod site.yml` | **deny** |
 | `ansible prod-db -m ping` (read-only module) | defer |
 | `echo done && kubectl --context prod-us delete ns x` | **deny** |
@@ -180,7 +181,7 @@ mode that matters.
 | `ssh` | destination host (`user@host`, `-J` jump host) | n/a — denylist-only: a prod destination is denied, everything else defers (see [Limitations](#limitations)) |
 | `argocd` | `--server` | `current-context` in `~/.config/argocd/config` |
 | `doctl` | `--context` | the doctl auth context (never read — always prompts) |
-| `pulumi` | `--stack` / `-s` | the selected stack (never read — always prompts); `pulumi stack select` prompts (denies for a prod stack) |
+| `pulumi` | `--stack` / `-s` | the per-project selected stack, read from `~/.pulumi/workspaces/` (a prod selection denies; otherwise prompts); `pulumi stack select` prompts (denies for a prod stack) |
 | `ansible`, `ansible-playbook` | `-i` / `--inventory`, `--limit`, and (ad-hoc) the host pattern | `ANSIBLE_INVENTORY`, then `[defaults] inventory` in `ansible.cfg`. The inventory is the target; `--limit`/pattern can only *escalate* to a prod deny. `--syntax-check`/`--list-hosts`/`--list-tasks`/`--list-tags` and ad-hoc `-m ping`/`setup`/`debug` are read-only |
 | `kubectx` / `kubens` | n/a | switching contexts/namespaces *is* the shared-state mutation; prompts (denies for a prod context) |
 | `kustomize` | n/a | local-only tool; always defers (the `kubectl apply` it pipes into is guarded separately) |
@@ -336,10 +337,14 @@ python3 scripts/friction-report.py --since 30d --repo gateway --top 20
   prod host is treated as mutating: an interactive prod shell is the blast
   radius, and a read-only remote command can't be distinguished from a
   destructive one.
-- The doctl auth context and pulumi's selected stack are not read from disk; a
-  mutating command relying on them always prompts rather than resolving the
-  ambient value (`pulumi stack select <prod>` is still denied, so choosing a
-  prod stack is caught).
+- The doctl auth context is not read from disk; a mutating command relying on
+  it always prompts rather than resolving the ambient value.
+- pulumi's selected stack is read from `~/.pulumi/workspaces/` (or `$PULUMI_HOME`)
+  to deny an ambient prod selection. Recent pulumi can relocate that directory in
+  "agent mode" when `~/.pulumi` isn't writable and no `PULUMI_HOME` is set; the
+  guard doesn't follow that relocation, so the file simply isn't found and the
+  command prompts (fail-open) rather than resolving. `pulumi stack select <prod>`
+  is still denied regardless.
 - Ambient state is read at *hook* time; a race remains between the hook's
   check and the command's execution. Pinning the target with a flag — which
   the ask message steers toward — is the real fix; the prompt exists to
