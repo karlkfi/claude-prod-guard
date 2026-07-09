@@ -100,6 +100,17 @@ An `allow` from one hook can ride past both the user's permission settings and t
 
 The verb tables are allowlists of *known read-only* verbs, not catalogs of destructive ones. Cataloging destruction is unwinnable — every CLI release adds verbs, and missing one is exactly the false negative this guard exists to prevent. Missing a read-only verb costs one spurious prompt and a one-line table fix.
 
+### Why shell variables in resolved targets are expanded
+
+The target of a mutating command is frequently pinned through a shell variable — `CTX=<ctx> kubectl --context $CTX …`, or a chain that assembles it (`P=…; Z=…; CTX=gke_${P}_${Z}_… kubectl --context $CTX …`). Because `shlex` tokenizes without expanding, the value the guard originally classified was the literal string `$CTX`, which matches no pattern and prompts (UNKNOWN + mutating → `ask`). That was the single largest source of prompt fatigue in practice — and worse, a *silent security hole*: a production context pinned through a variable slid from `deny` down to `ask`, because the guard never saw the prod name. Expanding the variable fixes both directions at once — it silences the nonprod case and restores the prod `deny` — so it is strictly an improvement, not a security/convenience trade.
+
+The expansion is safe because it can only ever make classification *more specific*, never silently allow. It is bounded to the two directions that are unambiguous:
+
+- **Only simple `$NAME` / `${NAME}` references are expanded.** Command substitution `$(…)`, arithmetic `$((…))`, and every `${…}` operator form (`${V:-default}`, `${#V}`, `${!V}`, …) are left literal, so a target the guard can't evaluate with certainty falls back to the existing prompt/deny rather than a guessed value. Under-expanding is always the safe direction: an unresolved target stays UNKNOWN (or, unpinned, denies).
+- **An undefined variable is left literal, never blanked.** `$NOPE` stays `$NOPE` and classifies UNKNOWN → prompt, rather than expanding to empty and possibly changing the decision. This mirrors the fail-closed rule everywhere else: the guard never resolves ambiguity in favor of allowing a mutation.
+
+The one subtlety is scope. A bare `P=x` (or same-shell) assignment is a shell variable, not exported; a child process — the body of `bash -c '…'` / `eval` — sees only *exported* variables. So the guard tracks two scopes: same-shell expansion resolves the full set (bare + exported + inline), while a nested `sh -c` body is expanded only against what the invoking segment exports. Getting this wrong in the lenient direction would be a real false negative — a bare var leaking into a child body could turn a genuinely-unpinned mutation into a false defer — which is exactly the failure mode this guard exists to prevent, so the nested body deliberately under-expands. Inline `A=x cmd` assignments *are* exported to that command's own children (bash semantics), so `CTX=x bash -c '… $CTX …'` still resolves, while `CTX=x; bash -c '… $CTX …'` does not.
+
 ### Why defer, not allow, for everything else
 
 Same reasoning as the siblings: unparseable commands, uncovered tools, and read-only verbs hand control back to the normal permission flow — the user is no worse off than without the hook. Fail-open applies to *infrastructure* failures only (bad JSON, missing config file, an exception in the hook): a hook bug must never break the session. The *security* decision is where the guard fails closed.

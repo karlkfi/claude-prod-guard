@@ -249,6 +249,50 @@ def extract_env_prefix(argv):
     return env, argv[i:]
 
 
+# Only a bare `$NAME` or `${NAME}` reference is expanded. Every other `$` form
+# is deliberately NOT matched, so it is left literal and the target stays
+# UNKNOWN (→ prompt) rather than being silently mis-expanded: command
+# substitution `$(...)`, arithmetic `$((...))`, all `${...}` operator forms
+# (`${V:-x}`, `${#V}`, `${!V}`, …) because the `{NAME}` branch requires the `}`
+# immediately after the name, and positional/special params (`$1`, `$@`, `$$`,
+# `$?`) because the bare branch requires a letter/underscore right after `$`.
+VAR_REF_RE = re.compile(r'\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))')
+
+
+def expand_vars(value, env):
+    """Expand simple `$NAME` / `${NAME}` references in `value` against `env`.
+
+    Conservative by construction: an undefined name is left LITERAL (`$CTX`
+    stays `$CTX`) rather than blanked, so an unresolvable target stays UNKNOWN
+    and still prompts — expansion only ever makes classification *more*
+    specific, never silently allows. `env` values are assumed already resolved
+    (the caller folds them left-to-right), so one pass suffices."""
+    def repl(m):
+        name = m.group(1) or m.group(2)
+        return env[name] if name in env else m.group(0)
+    return VAR_REF_RE.sub(repl, value)
+
+
+def resolve_assignments(pairs, base_env):
+    """Fold an ordered iterable of (name, raw_value) onto a copy of `base_env`,
+    expanding each value against the env accumulated so far — left-to-right, as
+    the shell does, so `CTX=gke_${P}_${Z}` resolves against earlier
+    assignments. Returns the new env dict."""
+    env = dict(base_env)
+    for name, value in pairs:
+        env[name] = expand_vars(value, env)
+    return env
+
+
+# Builtins that carry persisting `NAME=val` operands (`export FOO=bar`).
+ASSIGN_BUILTINS = frozenset({'export', 'declare', 'typeset', 'readonly', 'local'})
+
+
+def expand_argv(argv, env):
+    """Expand simple variable references in every token of `argv`."""
+    return [expand_vars(tok, env) for tok in argv]
+
+
 def strip_wrappers(argv, env):
     """Remove leading launcher commands (sudo, env, timeout, xargs, ...) so
     the covered tool underneath is classified, not the wrapper. `env`
@@ -1892,11 +1936,13 @@ COVERED_TOOLS = frozenset(EVALUATORS)
 # Segment evaluation and main
 # ---------------------------------------------------------------------------
 
-def evaluate_command_string(raw, ctx, depth=0):
+def evaluate_command_string(raw, ctx, depth=0, exported=None):
     """Findings for a full command string: tokenize, split into simple
     commands, evaluate each. Recurses (bounded) into `sh -c '...'` and
-    `eval ...` bodies so a quoted nested command can't ride past the guard.
-    Returns (findings, override_seen)."""
+    `eval ...` bodies so a quoted nested command can't ride past the guard;
+    the recursion passes the invoking segment's exported env so `$VAR` in the
+    body resolves as a child process would see it. Returns
+    (findings, override_seen)."""
     findings = []
     override = False
     if depth > 3:
@@ -1904,24 +1950,62 @@ def evaluate_command_string(raw, ctx, depth=0):
     tokens = tokenize(raw)
     if tokens is None:
         return findings, override  # unparseable: fail-open
+    # Two scopes, both seeded from what this shell inherited (os.environ at the
+    # top level, the invoking segment's exported env for a nested `sh -c`/`eval`
+    # body):
+    #   shell_env  — variables visible to same-shell `$VAR` expansion. A bare
+    #     `P=x` segment (a shell var, not exported) accumulates here so a later
+    #     segment on the same line resolves it.
+    #   exported   — what a CHILD process inherits. Bare assignments do NOT go
+    #     here; only `export NAME=val` does. A nested `sh -c` body is expanded
+    #     against this, never against bare shell vars — under-expanding a nested
+    #     body is safe (unresolved target → prompt/deny); over-expanding it
+    #     could turn a genuinely-unpinned command into a false defer.
+    if exported is None:
+        exported = dict(os.environ)
+    shell_env = dict(exported)
+    exported = dict(exported)
     for group in split_simple_commands(tokens):
-        seg_env, argv = extract_env_prefix(group)
-        if 'PROD_GUARD_OVERRIDE' in seg_env:
+        seg_env, argv_raw = extract_env_prefix(group)
+        # This segment's inline `A=x cmd` assignments, resolved left-to-right
+        # against the current shell env. They export to this command's own
+        # children but do not persist to the chain.
+        inline = resolve_assignments(seg_env.items(), shell_env)
+        seg_inline = {k: inline[k] for k in seg_env}
+        same_shell = {**shell_env, **seg_inline}   # for this command's args
+        child_env = {**exported, **seg_inline}     # for its `sh -c`/`eval` body
+        if 'PROD_GUARD_OVERRIDE' in seg_inline:
             override = True
-        argv = strip_wrappers(argv, seg_env)
+        # Expanded view for classification; raw view (nested-body extraction)
+        # is left unexpanded so the child re-expands it against child_env.
+        argv = strip_wrappers(expand_argv(argv_raw, same_shell), seg_inline)
+        argv_raw = strip_wrappers(list(argv_raw), {})
         if not argv:
+            # Assignment-only segment (`P=x`): a shell var, not exported.
+            shell_env.update(seg_inline)
             continue
         tool = os.path.basename(argv[0])
+        if tool in ASSIGN_BUILTINS:
+            # `export NAME=val …`: operands persist and are exported. argv is
+            # already expanded, so the values are resolved.
+            for tok in argv[1:]:
+                if not tok.startswith('-') and ASSIGNMENT_RE.match(tok):
+                    name, _, value = tok.partition('=')
+                    shell_env[name] = value
+                    exported[name] = value
+            continue
         if tool in SHELL_NAMES:
-            # bash -c 'kubectl ...': evaluate the -c body as its own command.
-            body = first_flag_value(argv, ('-c',))
+            # bash -c 'kubectl ...': evaluate the -c body as its own command,
+            # inheriting only exported vars.
+            body = first_flag_value(argv_raw, ('-c',))
             if body:
-                sub_f, sub_o = evaluate_command_string(body, ctx, depth + 1)
+                sub_f, sub_o = evaluate_command_string(body, ctx, depth + 1, child_env)
                 findings += sub_f
                 override = override or sub_o
             continue
         if tool == 'eval':
-            sub_f, sub_o = evaluate_command_string(' '.join(argv[1:]), ctx, depth + 1)
+            sub_f, sub_o = evaluate_command_string(
+                ' '.join(argv_raw[1:]), ctx, depth + 1, child_env)
             findings += sub_f
             override = override or sub_o
             continue
@@ -1930,7 +2014,7 @@ def evaluate_command_string(raw, ctx, depth=0):
             continue  # uncovered tool: defer
         if len(argv) == 1:
             continue  # bare tool name prints help; nothing to guard
-        findings += evaluator(argv, seg_env, ctx)
+        findings += evaluator(argv, seg_inline, ctx)
     return findings, override
 
 
