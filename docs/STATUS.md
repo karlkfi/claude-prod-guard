@@ -14,7 +14,7 @@ Single source of truth for progress and priorities in prod-guard. Pick the next 
 - **New item identified:** append it to the Queue with the next unused ID. Batch audit-discovery items in one commit.
 - **`Last touched:` is one line, date only.** Do not append session narrative.
 
-Last touched: 2026-07-04
+Last touched: 2026-07-09
 
 ---
 
@@ -24,4 +24,4 @@ Specific actionable items in priority order. Pick from the top; skip 🚫 items 
 
 | ID | Item | Labels | St | Sz | Notes |
 |---|---|---|---|---|---|
-| _(empty)_ | | | | | |
+| <a id="Q11"></a>Q11 | Expand `$VAR`/`${VAR}` in resolved targets so a var-pinned context (`CTX=… kubectl --context $CTX`) classifies by its value, not the literal `$CTX` | `parsing` `security` `bug` | 🔲 | M | Friction report: ~68% of prompts are var-expanded targets; also a hole — a prod target behind a var downgrades deny→ask. Plan: [`docs/plan/variable-expansion.md`](plan/variable-expansion.md) |
