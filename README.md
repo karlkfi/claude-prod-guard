@@ -206,6 +206,18 @@ Compound commands are split and each segment evaluated: `&&`, `||`, `|`,
 `nohup`, `time`). A guard that only inspected the first token would be
 trivially bypassed by `echo hi && kubectl --context prod delete ns x`.
 
+Simple shell variables in a resolved target are expanded before
+classification, so the common `CTX=<ctx> kubectl --context $CTX …` /
+`P=…; CTX=gke_${P}_… kubectl --context $CTX …` pattern classifies by the
+context's *value*, not the literal `$CTX`. Expansion resolves inline
+(`A=x cmd`) and `export`/bare (`P=x; …`) assignments left-to-right, following
+shell scope (a bare, unexported var does not expand inside a nested
+`bash -c` body). It is deliberately conservative: an **undefined** variable is
+left literal (so the target stays unknown and still prompts, never silently
+allowed), and non-trivial `$` forms — command substitution `$(…)`, arithmetic,
+and every `${…}` operator (`${V:-default}`, `${#V}`, …) — are not expanded, so
+they too fall back to a prompt rather than a guessed value.
+
 ## Configuration
 
 Targets are classified by two regex lists (Python syntax, case-insensitive,
@@ -366,6 +378,13 @@ python3 scripts/friction-report.py --since 30d --repo gateway --top 20
 - Command parsing is intentionally conservative: an operator inside a quoted
   string can split a segment and produce a spurious prompt (never a missed
   one). Heredoc bodies mentioning covered tools may likewise prompt.
+- Variable expansion covers simple `$VAR`/`${VAR}` references only. A target
+  assembled with a `${VAR:-default}` operator, command substitution
+  (`--context $(kubectl config current-context)`), or an indirection is left
+  unexpanded and classified as its literal text — which errs toward a prompt,
+  except in the corner case where that literal happens to contain a
+  prod/nonprod word. A variable exported into the session before Claude Code
+  started is visible to the hook and expands as the shell would.
 - In full-auto `bypassPermissions` mode there is no one to answer an ask, so
   asks are emitted as denies — equally blocking, but the agent gets the
   reason and can re-route instead of stalling.

@@ -252,6 +252,97 @@ class ParsingTests(unittest.TestCase):
                          ["delete", "pod", "x"])
 
 
+class ExpandVarsTests(unittest.TestCase):
+    """Unit tests for the conservative $VAR / ${VAR} expander (Q11)."""
+
+    def test_simple_and_braced(self):
+        env = {"CTX": "kind-ci"}
+        self.assertEqual(guard.expand_vars("$CTX", env), "kind-ci")
+        self.assertEqual(guard.expand_vars("${CTX}", env), "kind-ci")
+        self.assertEqual(guard.expand_vars("gke_${CTX}_x", env), "gke_kind-ci_x")
+
+    def test_undefined_stays_literal(self):
+        # Never blanked — an unresolvable ref must stay UNKNOWN, not vanish.
+        self.assertEqual(guard.expand_vars("$NOPE", {}), "$NOPE")
+        self.assertEqual(guard.expand_vars("${NOPE}", {}), "${NOPE}")
+
+    def test_partial_expansion_leaves_undefined(self):
+        env = {"P": "acme_dev"}
+        self.assertEqual(guard.expand_vars("gke_${P}_${Z}", env), "gke_acme_dev_${Z}")
+
+    def test_operator_and_substitution_forms_declined(self):
+        # These $ forms are NOT simple refs: left untouched so the value stays
+        # literal and errs toward a prompt/deny rather than a wrong expansion.
+        env = {"V": "kind-ci"}
+        for form in ("${V:-def}", "${V:+alt}", "${V:=def}", "${V?err}",
+                     "${#V}", "${!V}", "$(get-ctx)", "$((1+2))",
+                     "$1", "$@", "$$", "$?"):
+            self.assertEqual(guard.expand_vars(form, env), form, form)
+
+    def test_resolve_assignments_left_to_right(self):
+        env = guard.resolve_assignments(
+            [("P", "acme_prod"), ("Z", "us-east1"), ("CTX", "gke_${P}_${Z}")], {})
+        self.assertEqual(env["CTX"], "gke_acme_prod_us-east1")
+
+
+class VariableExpansionDecisionTests(unittest.TestCase):
+    """End-to-end: a target pinned through a shell variable classifies by its
+    value, not the literal `$CTX` (Q11). This both silences the dominant
+    friction source and closes a hole where a prod target behind a variable
+    downgraded from deny to ask."""
+
+    def test_inline_nonprod_var_defers(self):
+        decision, _ = run_hook("CTX=kind-ci kubectl --context $CTX delete ns x")
+        self.assertIsNone(decision)
+
+    def test_inline_prod_var_denies(self):
+        decision, reason = run_hook(
+            "CTX=gke_acme_prod-us kubectl --context $CTX delete ns x")
+        self.assertEqual(decision, "deny")
+        self.assertIn("gke_acme_prod-us", reason)
+
+    def test_chained_nested_braces_prod_denies(self):
+        decision, reason = run_hook(
+            "P=acme_prod; Z=us-east1-b; C=c; "
+            "CTX=gke_${P}_${Z}_${C} kubectl --context $CTX delete ns x")
+        self.assertEqual(decision, "deny")
+        self.assertIn("gke_acme_prod_us-east1-b_c", reason)
+
+    def test_chained_nested_braces_nonprod_defers(self):
+        decision, _ = run_hook(
+            "P=acme_dev; Z=z; C=c; "
+            "CTX=gke_${P}_${Z}_${C} kubectl --context $CTX delete ns x")
+        self.assertIsNone(decision)
+
+    def test_export_persists_across_segments(self):
+        d1, _ = run_hook("export CTX=kind-ci; kubectl --context $CTX delete ns x")
+        self.assertIsNone(d1)
+        d2, r2 = run_hook("export CTX=gke_acme_prod; kubectl --context $CTX delete ns x")
+        self.assertEqual(d2, "deny")
+        self.assertIn("gke_acme_prod", r2)
+
+    def test_undefined_var_still_prompts(self):
+        # Unresolved → literal `$NOPE` → UNKNOWN explicit target → ask.
+        decision, reason = run_hook("kubectl --context $NOPE apply -f m.yaml")
+        self.assertEqual(decision, "ask")
+
+    def test_bare_var_does_not_leak_into_child_shell(self):
+        # A bare (unexported) shell var is NOT visible to a `bash -c` child, so
+        # it must not expand there. The nested body then has no explicit target
+        # and its unpinned mutation must not be silently deferred as nonprod.
+        decision, _ = run_hook(
+            "CTX=kind-ci; bash -c 'kubectl --context $CTX delete ns x'")
+        self.assertNotEqual(decision, None,
+                            "bare var leaked into child shell → false defer")
+
+    def test_inline_var_is_exported_to_child_shell(self):
+        # An inline `CTX=x bash -c ...` DOES export CTX to the child, so it
+        # resolves there and a nonprod value defers.
+        decision, _ = run_hook(
+            "CTX=kind-ci bash -c 'kubectl --context $CTX delete ns x'")
+        self.assertIsNone(decision)
+
+
 class KubectlDecisionTests(unittest.TestCase):
     def test_prod_mutating_denied(self):
         decision, reason = run_hook("kubectl --context gke_acme_prod-us delete ns x")
