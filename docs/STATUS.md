@@ -5,7 +5,7 @@ Single source of truth for progress and priorities in prod-guard. Pick the next 
 **Status:** 🔲 ready · 🚫 blocked
 **Size:** S = one session · M = 2–3 sessions · L = needs a plan doc under `docs/plan/`
 **Labels:** `security` `tests` `docs` `infra` `bug` `parsing` `coverage`
-**Next ID:** Q12
+**Next ID:** Q13
 
 ## Queue
 
@@ -17,4 +17,4 @@ Single source of truth for progress and priorities in prod-guard. Pick the next 
 
 | ID | Item | Labels | Sz | Trigger to revive |
 |---|---|---|---|---|
-| _(empty)_ | | | | |
+| <a id="Q12"></a>Q12 | Session-scoped override for the mixed prod/dev dogfood cluster | `security` | M | **Event:** a friction re-measurement after Q11's shell-variable expansion shows the dogfood cluster still drives most prompts. |
