@@ -10,7 +10,7 @@ Build the right thing AND build it well. Before writing any code, state the goal
 
 Make the smallest change that achieves the goal. If you notice problems outside the current task's scope, flag them rather than fixing them:
 - New near-term work → add a row to the Queue in `docs/STATUS.md` in priority order.
-- Larger / speculative work → add a Queue row marked `💤 deferred` with a one-line rationale.
+- Larger / speculative work → add a row to the Deferred table in `docs/STATUS.md` with a concrete revive trigger (`**Demand:**` / `**Event:**` / `**Decision:**`).
 
 Capture knowledge durably, don't leave it in chat. When the user states a standing preference or decision, persist it in the repo (CLAUDE.md, the relevant `docs/` file, or memory) rather than applying it once and moving on. When follow-up work surfaces mid-task, record it on the Queue in `docs/STATUS.md` — including the *why* of any decision it depends on — instead of only mentioning it in the response.
 
@@ -95,7 +95,7 @@ When working on specific tasks, read the relevant doc before starting:
 | Task | Reference |
 |---|---|
 | Picking the next task, tracking progress, adding new items | `docs/STATUS.md` — also run `gh pr list` and skip any Queue item already covered by an open PR |
-| Editing `docs/STATUS.md` (any change to the Queue or header) | `docs/development/maintaining-backlog.md` |
+| Editing `docs/STATUS.md` (any change to the Queue or header) | Invoke the `backlog` skill; repo wiring in `docs/development/maintaining-backlog.md` |
 | Changing decision semantics, verb tables, or covered tools | `scripts/bash-prod-guard.py` + `README.md` decision table + `docs/design.md` |
 | Plugin packaging / marketplace listing | `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` |
 | Cutting a release (version bump, tag, GitHub Release) | `docs/development/release-process.md` |
