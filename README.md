@@ -31,7 +31,7 @@ config — classifies that target against configurable patterns, and:
 - [The two threat models](#the-two-threat-models)
 - [What it does](#what-it-does)
 - [Install](#install)
-- [Upgrade](#upgrade)
+- [Keeping it updated](#keeping-it-updated)
 - [Covered tools](#covered-tools)
 - [Configuration](#configuration)
 - [The override escape hatch](#the-override-escape-hatch)
@@ -144,6 +144,22 @@ After installing with either method:
 
 - Requires `python3` on your PATH.
 - Restart Claude Code (or `/reload-plugins`) so the hook is registered.
+- **Turn on auto-update now.** A GitHub marketplace pins the version you
+  installed and never refreshes on its own (see
+  [Keeping it updated](#keeping-it-updated)) — so a stale classifier silently
+  misses later false-negative fixes. Add this to `~/.claude/settings.json` at
+  install time, while you're thinking about it, so the guard keeps itself
+  current:
+  ```json
+  {
+    "extraKnownMarketplaces": {
+      "prod-guard": {
+        "source": { "source": "git", "url": "https://github.com/karlkfi/claude-prod-guard.git" },
+        "autoUpdate": true
+      }
+    }
+  }
+  ```
 - **Add your real production identifiers to the config** — the built-in
   patterns catch names containing `prod`/`production`/`prd`/`live`, but your
   GCP project ids, cluster names, and subscriptions deserve explicit
@@ -153,21 +169,45 @@ To verify, ask Claude to run `kubectl --context fake-prod delete ns test` —
 it should be blocked with a prod-guard reason. A `kubectl --context kind-...
 get pods` should run without any prod-guard output.
 
-## Upgrade
+## Keeping it updated
 
-prod-guard installs from a GitHub marketplace, which Claude Code tracks at
-the repository's default branch (`main`). It does **not** auto-update by
-default:
+Claude Code auto-updates **official Anthropic marketplaces only**. prod-guard
+installs from a third-party GitHub marketplace, and those **never refresh on
+their own** — the version you installed stays pinned until you either enable
+auto-update or update it by hand. For a guard plugin that pin has teeth: a
+stale classifier is missing later false-negative fixes, not just conveniences.
+(The author's own machine ran 1.1.0 while the repo shipped 2.x — a full major
+version behind, missing the shell-variable-expansion classifier and more.)
+
+**Recommended — set and forget.** Add `autoUpdate` for the marketplace in
+`~/.claude/settings.json` and Claude Code refreshes it like an official one:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "prod-guard": {
+      "source": { "source": "git", "url": "https://github.com/karlkfi/claude-prod-guard.git" },
+      "autoUpdate": true
+    }
+  }
+}
+```
+
+**Manual.** Update the marketplace clone, then the installed plugin, then
+restart to apply:
 
 ```
-/plugin marketplace update prod-guard
-/plugin uninstall prod-guard@prod-guard
-/plugin install prod-guard@prod-guard
+claude plugin marketplace update prod-guard
+claude plugin update prod-guard@prod-guard
 ```
 
-Then `/reload-plugins` (or restart) and compare the `/plugin` menu's
-installed version against the
-[latest release](https://github.com/karlkfi/claude-prod-guard/releases).
+These `claude` CLI commands work headlessly and share Claude Desktop's plugin
+state, so they update a Desktop install too (Desktop has no `/plugin` slash
+command). On the CLI or an IDE extension you can equivalently run
+`/plugin marketplace update prod-guard` then `/plugin install prod-guard@prod-guard`.
+Compare the installed version against the
+[latest release](https://github.com/karlkfi/claude-prod-guard/releases) after
+updating.
 
 ## Covered tools
 
