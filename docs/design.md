@@ -26,7 +26,11 @@ A `PreToolUse` hook on `Bash` that:
    - no explicit target (ambient) + mutating → **deny** with a self-healing
      fix-it naming the pin flag (deny-with-reason, not ask; override downgrades
      to ask)
-   - context-switching command → **ask** (deny if the new target is prod)
+   - target-repointing switch command (`use-context`, `kubectx`,
+     `gcloud config set`, `az account set`, `docker context use`) → **deny**
+     regardless of the new target (override downgrades to ask); shared-state
+     writers with no pin alternative (logins, credential writes, `kubens`) →
+     **ask** (deny if a named target is prod)
    - everything else → **defer** (no output)
 
 ## Why these specific design choices
@@ -69,10 +73,36 @@ travels in the decision reason, so the human who does see a prompt (an unknown
 explicit target, or an overridden deny) always sees where the mutation lands,
 with no risk of an agent-authored echo that doesn't match the real flags.
 
-The carve-outs are deliberate. A command whose *whole purpose* is to switch
-shared state (`kubectl config use-context`, `kubectx`, `gcloud config set`) has
-no per-command target to pin, so it stays an `ask` (a deny for a prod switch).
-An *explicit* target that classifies UNKNOWN stays an `ask` too: it is pinned
+The switch commands that *do the repointing* — `kubectl config use-context`
+(and its alias `kubectl config set current-context`), `kubectx`,
+`gcloud config set`/`unset` and `gcloud config configurations activate`,
+`az account set`, `docker context use` — are denied outright, for the same
+reasons the unpinned mutation is: the repoint clobbers the ambient target of
+*every* parallel session regardless of what it switches to (a switch to a
+harmless kind context still redirects another session's unpinned command),
+and the deny is machine-actionable — each of these tools has a per-command
+pin flag (`--context`, `--project`, `--subscription`) that makes the switch
+unnecessary, and the deny names it. Asking (the earlier behavior) taught
+nothing and put a human in the loop on a question — "is repointing shared
+state OK?" — whose answer under the parallel-session threat model is always
+"pin instead". `PROD_GUARD_OVERRIDE` downgrades to a confirm for the rare
+genuinely-intended switch (e.g. a human asking to set up their default
+environment).
+
+The remaining carve-outs are deliberate. Shared-state writers with **no
+per-command pin alternative** — credential logins (`gcloud auth`, `oc login`,
+`az login`, `terraform login`) and config-file editors (`aws configure`,
+non-repointing `kubectl config` edits) — stay an `ask` (a deny when a named
+target classifies prod): there is no flag to steer the agent to, so a deny
+would just be an override tax on operations that are sometimes the only way
+to proceed. Default-namespace switches (`kubens`, `oc project`) also stay an
+`ask`: `-n` is the per-command pin, but the clobber blast radius is a
+namespace *within* a cluster the guard has already vetted per command — a
+question a human can reasonably answer, unlike a cluster-level repoint. The switch-deny is also scoped to the *machine-global* active-target
+switches; selections whose blast radius is a directory or a single tool's own
+config (`terraform workspace select`, `pulumi stack select`,
+`argocd context`) still confirm rather than block. An *explicit* target that
+classifies UNKNOWN stays an `ask` too: it is pinned
 (not clobber-prone), just unclassified — the fail-closed confirm, not the
 unpinned deny. And a tool whose "ambient" is cwd/file-scoped rather than
 clobber-prone shared state — docker's local daemon, ansible's `ansible.cfg`

@@ -33,15 +33,17 @@ import os
 import re
 import sys
 
-# prod-guard builds every decision reason from one of four helpers in
-# bash-prod-guard.py, each carrying a stable signature substring. Two deny
-# (deny-prod, deny-ambient) and two ask (ask-unknown, ask-switch). Order matters
-# only for display; a reason segment matches exactly one (the signatures are
-# mutually exclusive).
+# prod-guard builds every decision reason from one of five helpers in
+# bash-prod-guard.py, each carrying a stable signature substring. Three deny
+# (deny-prod, deny-ambient, deny-switch) and two ask (ask-unknown, ask-switch).
+# Matching is first-match in dict order: deny-switch must precede ask-switch,
+# whose broader signature also appears in deny-switch reasons (and in the
+# pre-2.3 ask-form switch decisions still present in old transcripts).
 CATEGORY_PATTERNS = {
     'deny-prod':    re.compile(r'matches a production pattern'),
     'ask-unknown':  re.compile(r'matches neither a production'),
     'deny-ambient': re.compile(r'shared mutable state that a parallel session'),
+    'deny-switch':  re.compile(r'Switching shared state is blocked'),
     'ask-switch':   re.compile(r'is shared by every session'),
 }
 
@@ -50,6 +52,7 @@ CATEGORY_HINT = {
     'deny-prod':    'intended block (prefix PROD_GUARD_OVERRIDE=<reason> only if truly intentional)',
     'ask-unknown':  'add a vetted nonprod pattern for the target to .claude/prod-guard.json',
     'deny-ambient': 'pin the target explicitly (--context/--project/--profile/…) — the deny self-heals once pinned',
+    'deny-switch':  'pin per-command instead of switching shared state — the deny names the flag',
     'ask-switch':   'pin per-command instead of switching shared state',
 }
 

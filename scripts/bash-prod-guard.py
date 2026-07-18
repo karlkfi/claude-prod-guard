@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """PreToolUse hook: block mutating commands aimed at production targets and
-prompt when a mutating command relies on shared ambient context.
+block mutating commands that rely on shared ambient context instead of
+pinning their target.
 
 Two distinct threat models, kept distinct in the code:
 
@@ -16,8 +17,8 @@ Two distinct threat models, kept distinct in the code:
    the docker context, the default aws profile) instead of pinning its
    target. A parallel session can repoint that state between the moment the
    command is written and the moment it runs, silently redirecting the
-   mutation. The guard prompts (`ask`) and tells the caller to pin the target
-   with the tool's flag.
+   mutation. The guard denies (`deny`) with a fix-it that tells the caller to
+   pin the target with the tool's flag and retry.
 
 Decision semantics (per simple command; worst verdict wins across a chain):
 
@@ -32,10 +33,18 @@ Decision semantics (per simple command; worst verdict wins across a chain):
     with a self-healing fix-it (add the pin flag and retry): the ambient
     target is clobber-prone shared state, so the command cannot run until the
     target is explicit. Downgradable to `ask` with `PROD_GUARD_OVERRIDE`.
-  * context-switching commands (`kubectl config use-context`, `kubectx`,
-    `docker context use`, `gcloud config set`, `az account set`, ...) -> **ask**
-    (deny when the new target classifies PROD): they mutate the very shared
-    state threat model 2 is about.
+  * target-repointing switch commands (`kubectl config use-context`,
+    `kubectx`, `gcloud config set`, `az account set`, `docker context use`)
+    -> **deny** regardless of the new target's classification: they repoint
+    the very shared state threat model 2 is about for *every* parallel
+    session, and each has a per-command pin flag that makes the switch
+    unnecessary. The fix-it names that flag; `PROD_GUARD_OVERRIDE` downgrades
+    to ask when a switch is genuinely intended.
+  * other shared-state writers -> **ask** (deny when a named target
+    classifies PROD): credential logins and config edits with no per-command
+    pin alternative (`gcloud auth`, `oc login`, `aws configure`, kubeconfig
+    edits), and the namespace switches (`kubens`, `oc project`) whose clobber
+    blast radius stays inside an already-guarded cluster.
 
 Fail modes: fail OPEN on infrastructure errors (unparseable input, missing
 config, unexpected exceptions — the hook stays silent and never breaks the
@@ -1010,9 +1019,27 @@ def deny_ambient(action, ambient_desc, pin_hint):
             % (action, ambient_desc, pin_hint))
 
 
-def ask_switch(action, what):
-    return (ASK,
+def deny_switch(action, what, pin_hint):
+    """A command whose whole purpose is to repoint the shared active target.
+    Denied regardless of what the new target classifies as: the repoint
+    clobbers every parallel session, and a per-command pin flag makes it
+    unnecessary."""
+    return (DENY,
             'prod-guard: `%s` repoints %s, which is shared by every session '
+            'on this machine — parallel sessions relying on ambient context '
+            'will silently follow it. Switching shared state is blocked: pin '
+            'the target per command with %s instead. If the switch is '
+            'genuinely intended, prefix the command with '
+            'PROD_GUARD_OVERRIDE=<reason> for a confirmation prompt.'
+            % (action, what, pin_hint))
+
+
+def ask_switch(action, what):
+    """Shared-state writers with no per-command pin alternative (credential
+    logins, kubeconfig writers, default-namespace switches): confirm rather
+    than block."""
+    return (ASK,
+            'prod-guard: `%s` writes %s, which is shared by every session '
             'on this machine — parallel sessions relying on ambient context '
             'will silently follow it. Prefer per-command pinning '
             '(--context/--project/--profile) over switching shared state.'
@@ -1246,13 +1273,19 @@ def eval_kubectl(argv, seg_env, ctx):
         sub = words[1] if len(words) > 1 else None
         if sub in KUBECTL_CONFIG_READONLY:
             return []
-        if sub == 'use-context':
-            name = words[2] if len(words) > 2 else None
+        # `config set current-context <ctx>` is `use-context` by another name.
+        is_set_current = (sub == 'set' and len(words) > 2
+                          and words[2] == 'current-context')
+        if sub == 'use-context' or is_set_current:
+            name_idx = 3 if is_set_current else 2
+            name = words[name_idx] if len(words) > name_idx else None
             if name and classify_kube(name, seg_env) == 'prod':
                 return [deny_prod(action, "kube-context '%s'" % name)]
-            return [ask_switch(action, 'the shared kubeconfig current-context')]
+            return [deny_switch(action, 'the shared kubeconfig current-context',
+                                'kubectl --context <ctx>')]
         # set/set-context/delete-context/rename-context/unset/...: mutations
-        # of the shared kubeconfig itself.
+        # of the shared kubeconfig itself (but not of which context is
+        # current), with no per-command pin alternative.
         return [ask_switch(action, 'the shared kubeconfig')]
     if verb in KUBECTL_READONLY:
         return []
@@ -1319,10 +1352,12 @@ def eval_kubectx(argv, seg_env, ctx):
         return []
     name = args[0]
     if name == '-':
-        return [ask_switch('kubectx -', 'the shared kubeconfig current-context')]
+        return [deny_switch('kubectx -', 'the shared kubeconfig current-context',
+                            'kubectl --context <ctx>')]
     if classify_kube(name, seg_env) == 'prod':
         return [deny_prod('kubectx %s' % name, "kube-context '%s'" % name)]
-    return [ask_switch('kubectx %s' % name, 'the shared kubeconfig current-context')]
+    return [deny_switch('kubectx %s' % name, 'the shared kubeconfig current-context',
+                        'kubectl --context <ctx>')]
 
 
 def eval_kubens(argv, seg_env, ctx):
@@ -1346,11 +1381,17 @@ def eval_gcloud(argv, seg_env, ctx):
         value = words[3] if len(words) > 3 else None
         if value and classify(value) == 'prod':
             return [deny_prod(action, "gcloud config value '%s'" % value)]
-        return [ask_switch(action, 'the shared active gcloud configuration')]
+        return [deny_switch(action, 'the shared active gcloud configuration',
+                            'the matching per-command flag (gcloud --project '
+                            '<id> / --zone / --region / --account)')]
     if words[:2] == ['config', 'configurations']:
         if len(words) > 2 and words[2] in ('list', 'describe'):
             return []
-        return [ask_switch(action, 'the shared active gcloud configuration')]
+        # activate repoints the active configuration; create activates the
+        # new one by default; delete/rename mutate which configs exist.
+        return [deny_switch(action, 'the shared active gcloud configuration',
+                            'the matching per-command flag (gcloud --project '
+                            '<id> / --zone / --region / --account)')]
     if words[:1] == ['auth'] and len(words) > 1 and words[1] not in ('list', 'print-access-token', 'print-identity-token'):
         return [ask_switch(action, 'the shared gcloud credentials')]
     kind, _ = _scan_verb(lw, mutating_prefixes=GCLOUD_MUTATING_PREFIXES,
@@ -1461,7 +1502,8 @@ def eval_az(argv, seg_env, ctx):
         sub = first_flag_value(argv, ('--subscription', '-s'))
         if sub and classify(sub) == 'prod':
             return [deny_prod(action, "azure subscription '%s'" % sub)]
-        return [ask_switch(action, 'the shared active azure subscription')]
+        return [deny_switch(action, 'the shared active azure subscription',
+                            'az --subscription <id>')]
     if lw[:1] == ['login'] or lw[:1] == ['logout'] or lw[:2] == ['account', 'clear']:
         return [ask_switch(action, 'the shared azure credentials')]
     kind, _ = _scan_verb(lw, mutating_exact=AZ_MUTATING,
@@ -1559,7 +1601,8 @@ def eval_docker(argv, seg_env, ctx):
             name = words[2] if len(words) > 2 else None
             if name and classify(name) == 'prod':
                 return [deny_prod(action, "docker context '%s'" % name)]
-            return [ask_switch(action, 'the shared docker context')]
+            return [deny_switch(action, 'the shared docker context',
+                                'docker --context <ctx>')]
         return []  # ls/show/inspect/create/rm: no daemon mutation
     if verb == 'push':
         ref = words[1] if len(words) > 1 else None

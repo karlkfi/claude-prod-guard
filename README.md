@@ -19,10 +19,11 @@ infrastructure command will actually land — the explicit `--context` /
 `--project` / `--profile` flag if present, otherwise the tool's ambient
 config — classifies that target against configurable patterns, and:
 
-- **blocks** mutating commands aimed at a **production** target, and mutating
+- **blocks** mutating commands aimed at a **production** target, mutating
   commands that don't pin their target at all — relying on **shared ambient
-  state** a parallel session can silently repoint — with a fix-it that tells
-  the agent which flag to add;
+  state** a parallel session can silently repoint — and the **switch commands
+  that do the repointing** (`kubectl config use-context`, `gcloud config set`,
+  …), each with a fix-it that tells the agent which flag to add;
 - **prompts** for mutating commands whose explicit target is **unknown**;
 - **stays silent** for everything else, so your normal permissions apply.
 
@@ -73,16 +74,19 @@ across `&&`/`|`/`;`/`$( )` chains):
 
 - **deny** — the command is blocked with a reason naming the resolved target
   and the override. This is the outcome for *mutating verb + production
-  target*, however the target was resolved (explicit flag or ambient state),
-  and for *mutating verb + no explicit target at all* (the clobbering risk) —
-  the latter with a fix-it naming the flag to add, so the agent re-runs
-  pinned instead of stalling a human.
+  target*, however the target was resolved (explicit flag or ambient state);
+  for *mutating verb + no explicit target at all* (the clobbering risk) —
+  with a fix-it naming the flag to add, so the agent re-runs pinned instead
+  of stalling a human; and for the *switch commands that repoint the shared
+  target itself* (`kubectl config use-context`, `kubectx`,
+  `gcloud config set`, `az account set`, `docker context use`) — regardless
+  of what they switch to, since the repoint clobbers every parallel session
+  and a per-command pin flag makes it unnecessary.
 - **ask** — Claude Code shows its standard permission prompt. This is the
   outcome for *mutating verb + unknown explicit target* (fail closed: unknown
-  is never silently allowed), and for commands that repoint shared state
-  itself (`kubectl config use-context`, `kubectx`, `gcloud config set`,
-  `az account set`, `docker context use`, `aws configure`, …) — which have no
-  target to pin.
+  is never silently allowed), and for shared-state writers that have no
+  per-command pin alternative (`gcloud auth login`, `oc login`,
+  `aws configure`, `kubens`, kubeconfig edits, …).
 - **defer** — the hook stays silent; your normal permission settings apply.
   This is the outcome for read-only verbs, non-production targets, and
   uncovered tools. prod-guard never emits `allow`, so it composes with other
@@ -118,8 +122,10 @@ across `&&`/`|`/`;`/`$( )` chains):
 | `aws s3 rm s3://bucket/key` (no profile pinned) | **deny** (pin `--profile`) |
 | `aws ec2 terminate-instances …` (default profile → prod SSO account) | **deny** |
 | `aws s3 rm … --profile admin` (`[profile admin]` → prod SSO account) | **deny** |
-| `kubectl config use-context kind-ci` | **ask** |
+| `kubectl config use-context kind-ci` | **deny** (pin `--context`) |
+| `gcloud config set project acme-dev` | **deny** (pin `--project`) |
 | `kubectx prod-us` | **deny** |
+| `gcloud auth login` | **ask** |
 | `PROD_GUARD_OVERRIDE=incident-42 kubectl --context prod-us delete ns x` | **ask** |
 
 ## Install
@@ -233,7 +239,7 @@ because a missed destructive form is the failure mode that matters.
 | `doctl` | `--context` | the doctl auth context (never read — an unpinned mutation denies, pin `--context`) |
 | `pulumi` | `--stack` / `-s` | the per-project selected stack, read from `~/.pulumi/workspaces/` (a prod selection denies; an unpinned mutation denies either way, pin `--stack`); `pulumi stack select` prompts (denies for a prod stack) |
 | `ansible`, `ansible-playbook` | `-i` / `--inventory`, `--limit`, and (ad-hoc) the host pattern | `ANSIBLE_INVENTORY`, then `[defaults] inventory` in `ansible.cfg`. The inventory is the target; `--limit`/pattern can only *escalate* to a prod deny. `--syntax-check`/`--list-hosts`/`--list-tasks`/`--list-tags` and ad-hoc `-m ping`/`setup`/`debug` are read-only |
-| `kubectx` / `kubens` | n/a | switching contexts/namespaces *is* the shared-state mutation; prompts (denies for a prod context) |
+| `kubectx` / `kubens` | n/a | switching contexts *is* the shared-state mutation: `kubectx <ctx>` (and `-`) is denied outright — pin `kubectl --context <ctx>` per command instead; `kubectx -d` and `kubens` still prompt |
 | `kustomize` | n/a | local-only tool; always defers (the `kubectl apply` it pipes into is guarded separately) |
 
 Ambient resolution is **pure local string work** — the guard parses the flag
@@ -364,9 +370,10 @@ flag to add. To keep work flowing:
   names the flag to add, so just re-run with it pinned. (A parallel session
   can repoint that shared state between writing the command and running it,
   which is why an explicit target is required.)
-- **Don't switch shared context** (`kubectl config use-context`, `kubectx`,
+- **Never switch shared context** (`kubectl config use-context`, `kubectx`,
   `gcloud config set project`, `az account set`, `docker context use`) —
-  that repoints every parallel session. Pin per command instead.
+  these are **denied** outright: they repoint every parallel session. Pin
+  per command instead.
 - **Unknown targets prompt.** If a legitimate non-prod target keeps
   prompting, add it to `.claude/prod-guard.json` under `"nonprod"` instead
   of approving repeatedly.
@@ -389,7 +396,7 @@ targets prompt over and over — run the friction report:
 It is a **read-only** analyzer: it re-reads the decisions Claude Code already
 recorded in your local session transcripts and adds no telemetry (see
 [PRIVACY.md](PRIVACY.md)). The report ranks prompts by category (`deny-prod`,
-`deny-ambient`, `ask-unknown`, `ask-switch`), by tool, and — most usefully — by
+`deny-ambient`, `deny-switch`, `ask-unknown`, `ask-switch`), by tool, and — most usefully — by
 **unclassified target**: the non-prod names that keep landing in `ask-unknown`
 are exactly the ones to add under `"nonprod"` in `.claude/prod-guard.json` (see
 [Configuration](#configuration)). Vet each before adding — never reclassify a
