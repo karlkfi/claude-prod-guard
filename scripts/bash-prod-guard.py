@@ -1070,9 +1070,13 @@ GCLOUD_MUTATING_PREFIXES = (
     'drain', 'suspend', 'resume', 'upgrade', 'rollback', 'abandon', 'copy-',
     'run-', 'execute', 'invoke', 'trigger',
 )
+# `read`/`tail` are the verbs of `gcloud logging read`/`gcloud logging tail`,
+# both read-only log queries. No gcloud surface uses them as mutating verbs,
+# and a mutating token anywhere else in the command still wins the scan, so
+# listing them here can't downgrade a genuinely mutating command (issue #16).
 GCLOUD_READONLY = frozenset({
     'list', 'describe', 'help', 'info', 'version', 'topic', 'export',
-    'config-helper',
+    'config-helper', 'read', 'tail',
 })
 GCLOUD_READONLY_PREFIXES = ('print-', 'get-')
 

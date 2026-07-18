@@ -1735,7 +1735,9 @@ class VerbSweepTests(unittest.TestCase):
 
     def test_gcloud_sweep(self):
         for tail in ("compute instances list", "compute instances describe vm1",
-                     "projects get-iam-policy p", "run services list"):
+                     "projects get-iam-policy p", "run services list",
+                     "logging read 'resource.type=gce_instance'",
+                     "logging tail 'resource.type=gce_instance'"):
             with self.subTest(tail=tail):
                 decision, _ = run_hook("gcloud %s --project acme-prod" % tail)
                 self.assertIsNone(decision)
