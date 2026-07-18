@@ -225,19 +225,36 @@ searched — not anchored):
 
 - **prod** patterns — a match means PROD. Built-ins: word-bounded
   `prod`/`production`/`prd`/`live`.
-- **nonprod** patterns — a match means NON-PROD, checked only after the prod
-  list (a name matching both classifies PROD). Built-ins: `kind-`/`k3d-`
+- **nonprod** patterns — a match means NON-PROD. Built-ins: `kind-`/`k3d-`
   prefixes, `minikube`, `docker-desktop`, `colima`, `rancher-desktop`,
   `orbstack`, `localhost`, `127.0.0.1`, and word-bounded
   `dev`/`test`/`qa`/`e2e`/`ci`/`sandbox`/`stage`/`staging`/`stg`/`local`/`demo`/`lab`/`preview`/`scratch`.
+
+Patterns are checked in **precedence order** — config beats the built-ins, and
+within each tier prod beats nonprod:
+
+1. **config prod** → PROD (an explicit denylist entry wins outright)
+2. **config nonprod** → NON-PROD (a vetted allowlist entry can clear a built-in
+   prod heuristic — this is the escape hatch for false positives like a repo
+   slug that merely contains `prod`, e.g. `karlkfi/claude-prod-guard`)
+3. **built-in prod** → PROD (the word-bounded heuristic)
+4. **built-in nonprod** → NON-PROD
+
+So a name matching *both* built-in lists (`prod-staging-mirror`) still classifies
+PROD — but a name you add under config `nonprod` classifies NON-PROD even when
+a built-in prod pattern also matches it. A config `prod` entry always wins, so
+clearing a heuristic this way can never mask a target you have explicitly vetted
+as production.
 
 **No match means UNKNOWN, and unknown + mutating prompts.** The default is
 fail-closed: the guard never silently allows a mutation to a target it can't
 classify. Classify your environments instead of approving the same prompt
 repeatedly.
 
-Patterns are merged from all of these (all additive — config can extend the
-built-ins, never shrink them):
+Patterns are merged from all of these (config is additive to the built-in
+*patterns* — it can add regexes but never delete one — and takes precedence
+over them per the order above; narrowing the boundary is always an explicit,
+reviewable config line, never a silent default):
 
 | Source | Purpose |
 | --- | --- |

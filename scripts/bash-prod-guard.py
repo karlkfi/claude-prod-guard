@@ -76,8 +76,11 @@ BUILTIN_PROD = [
 ]
 
 # Built-in non-production patterns: local cluster providers, loopback
-# registries, and the common environment names. Checked only after the prod
-# list — a name matching both (e.g. `prod-staging-mirror`) classifies PROD.
+# registries, and the common environment names. Checked after the built-in
+# prod list, so a name matching both built-in lists (e.g. `prod-staging-mirror`)
+# classifies PROD — but see classify(): a *config* nonprod entry outranks these
+# built-in prod patterns, which is the escape hatch for heuristic false
+# positives.
 BUILTIN_NONPROD = [
     r'^kind-', r'^k3d-', r'minikube', r'docker-desktop', r'desktop-linux',
     r'colima', r'rancher-desktop', r'orbstack',
@@ -86,7 +89,7 @@ BUILTIN_NONPROD = [
     r'|stage|staging|stg|local|demo|lab|preview|scratch)([^a-z0-9]|$)',
 ]
 
-_PATTERNS = None  # (prod_compiled, nonprod_compiled), loaded lazily
+_PATTERNS = None  # (cfg_prod, cfg_nonprod, builtin_prod, builtin_nonprod), lazy
 
 
 def _config_paths():
@@ -138,22 +141,31 @@ def _compile(patterns):
 
 
 def load_patterns():
-    """Merge built-ins + user file + project file + PROD_GUARD_CONFIG file
-    + PROD_GUARD_{PROD,NONPROD}_PATTERNS env vars. Everything is additive:
-    config can only extend the lists, never shrink the built-ins — narrowing
-    the boundary must be a code change, not a config drift."""
+    """Compile built-ins and config (user file + project file +
+    PROD_GUARD_CONFIG file + PROD_GUARD_{PROD,NONPROD}_PATTERNS env vars) into
+    four provenance-tagged lists: (cfg_prod, cfg_nonprod, builtin_prod,
+    builtin_nonprod).
+
+    Config is additive to the *set* of patterns — it can only add regexes,
+    never delete a built-in — but it carries higher precedence than the
+    built-ins in classify(): a human-vetted config `nonprod` entry can clear a
+    built-in prod heuristic (see classify()). Narrowing the boundary still
+    requires an explicit, reviewable config line — never a silent code
+    default."""
     global _PATTERNS
     if _PATTERNS is not None:
         return _PATTERNS
-    prod = list(BUILTIN_PROD)
-    nonprod = list(BUILTIN_NONPROD)
+    cfg_prod, cfg_nonprod = [], []
     for path in _config_paths():
         p, n = _load_config_file(path)
-        prod += p
-        nonprod += n
-    prod += _split_pattern_list(os.environ.get('PROD_GUARD_PROD_PATTERNS'))
-    nonprod += _split_pattern_list(os.environ.get('PROD_GUARD_NONPROD_PATTERNS'))
-    _PATTERNS = (_compile(prod), _compile(nonprod))
+        cfg_prod += p
+        cfg_nonprod += n
+    cfg_prod += _split_pattern_list(os.environ.get('PROD_GUARD_PROD_PATTERNS'))
+    cfg_nonprod += _split_pattern_list(os.environ.get('PROD_GUARD_NONPROD_PATTERNS'))
+    _PATTERNS = (
+        _compile(cfg_prod), _compile(cfg_nonprod),
+        _compile(BUILTIN_PROD), _compile(BUILTIN_NONPROD),
+    )
     return _PATTERNS
 
 
@@ -161,16 +173,34 @@ def classify(value):
     """'prod' | 'nonprod' | 'unknown' for a target string (context name,
     project id, profile, subscription, registry ref, repo slug...).
 
-    Prod patterns are checked first so an ambiguous name fails toward the
-    stricter class. No match at all is 'unknown' — which the policy treats
-    as ask, never allow (deny-on-unknown / fail-closed)."""
+    Precedence, strictest-authority first — config beats built-ins, and within
+    each provenance tier prod beats nonprod:
+
+      1. config  prod    -> prod   (an explicit denylist entry wins outright)
+      2. config  nonprod -> nonprod (a human-vetted allowlist entry can clear a
+                                     built-in prod heuristic — the config
+                                     escape hatch for false positives like a
+                                     repo slug that merely contains 'prod')
+      3. builtin prod    -> prod   (word-bounded prod/prd/live heuristic)
+      4. builtin nonprod -> nonprod
+
+    Fail-closed ordering is preserved *within* each tier (prod checked before
+    nonprod), so an ambiguous name still fails toward the stricter class among
+    equally-authoritative patterns. No match at all is 'unknown' — which the
+    policy treats as ask, never allow (deny-on-unknown / fail-closed)."""
     if not value:
         return 'unknown'
-    prod_res, nonprod_res = load_patterns()
-    for rx in prod_res:
+    cfg_prod, cfg_nonprod, builtin_prod, builtin_nonprod = load_patterns()
+    for rx in cfg_prod:
         if rx.search(value):
             return 'prod'
-    for rx in nonprod_res:
+    for rx in cfg_nonprod:
+        if rx.search(value):
+            return 'nonprod'
+    for rx in builtin_prod:
+        if rx.search(value):
+            return 'prod'
+    for rx in builtin_nonprod:
         if rx.search(value):
             return 'nonprod'
     return 'unknown'

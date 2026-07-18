@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from importlib import util
 from pathlib import Path
 
@@ -189,6 +190,41 @@ class ClassifyTests(unittest.TestCase):
 
     def test_prod_beats_nonprod_on_ambiguity(self):
         self.assertEqual(guard.classify("prod-staging-mirror"), "prod")
+
+    def test_config_nonprod_beats_builtin_prod(self):
+        # A human-vetted config nonprod entry clears a built-in prod heuristic
+        # (issue #17): a repo slug that merely contains `prod` as a segment.
+        with unittest.mock.patch.dict(
+                os.environ,
+                {"PROD_GUARD_NONPROD_PATTERNS": "karlkfi/claude-prod-guard"}):
+            guard._PATTERNS = None
+            self.assertEqual(
+                guard.classify("karlkfi/claude-prod-guard"), "nonprod")
+            # The remote-URL form resolves the same way (search, not anchored).
+            self.assertEqual(
+                guard.classify("git@github.com:karlkfi/claude-prod-guard.git"),
+                "nonprod")
+
+    def test_config_prod_beats_config_nonprod(self):
+        # Within the config tier, prod still wins on ambiguity (fail-closed).
+        with unittest.mock.patch.dict(
+                os.environ,
+                {"PROD_GUARD_PROD_PATTERNS": "acme-payments",
+                 "PROD_GUARD_NONPROD_PATTERNS": "acme-payments"}):
+            guard._PATTERNS = None
+            self.assertEqual(guard.classify("acme-payments"), "prod")
+
+    def test_config_prod_beats_builtin_nonprod(self):
+        # A config prod entry beats everything, including a built-in nonprod
+        # match — so a config nonprod clearing a heuristic can never be abused
+        # to also mask an explicitly-vetted prod pattern.
+        with unittest.mock.patch.dict(
+                os.environ,
+                {"PROD_GUARD_PROD_PATTERNS": "staging-that-is-really-prod"}):
+            guard._PATTERNS = None
+            # Matches builtin nonprod (`staging`) AND config prod -> prod.
+            self.assertEqual(
+                guard.classify("staging-that-is-really-prod"), "prod")
 
     def test_word_boundaries(self):
         # `prod` must not fire inside unrelated words.
@@ -1566,6 +1602,43 @@ class InfrastructureTests(unittest.TestCase):
         self.assertEqual(decision, "deny")
         decision, _ = run_hook("kubectl --context greenfin delete ns x", home=home)
         self.assertIsNone(decision)
+
+    def test_gh_repo_config_nonprod_clears_builtin_prod(self):
+        # issue #17: a repo slug matching the built-in prod heuristic (the
+        # guard's own repo, `-prod-` segment) is denied for mutating gh
+        # commands with no config, but a vetted config nonprod entry clears it.
+        decision, _ = run_hook(
+            "gh -R karlkfi/claude-prod-guard issue create -t bug -b oops")
+        self.assertEqual(decision, "deny")
+        decision, _ = run_hook(
+            "gh -R karlkfi/claude-prod-guard issue create -t bug -b oops",
+            env_extra={"PROD_GUARD_NONPROD_PATTERNS": "karlkfi/claude-prod-guard"})
+        self.assertIsNone(decision)
+
+    def test_config_nonprod_clears_builtin_prod_kubectl(self):
+        # The precedence fix is general, not gh-specific: a config nonprod
+        # entry clears a built-in prod match for any covered tool.
+        home = make_home()
+        cdir = os.path.join(home, ".claude")
+        os.makedirs(cdir)
+        with open(os.path.join(cdir, "prod-guard.json"), "w", encoding="utf-8") as f:
+            json.dump({"nonprod": ["gke_acme_prod-legacy-sandbox"]}, f)
+        decision, _ = run_hook(
+            "kubectl --context gke_acme_prod-legacy-sandbox delete ns x", home=home)
+        self.assertIsNone(decision)
+
+    def test_config_prod_still_beats_config_nonprod_e2e(self):
+        # A config prod entry wins even when a config nonprod entry also
+        # matches — fail-closed within the config tier.
+        home = make_home()
+        cdir = os.path.join(home, ".claude")
+        os.makedirs(cdir)
+        with open(os.path.join(cdir, "prod-guard.json"), "w", encoding="utf-8") as f:
+            json.dump({"prod": ["acme-payments"],
+                       "nonprod": ["acme-payments"]}, f)
+        decision, _ = run_hook(
+            "kubectl --context acme-payments delete ns x", home=home)
+        self.assertEqual(decision, "deny")
 
     def test_broken_config_falls_back_to_builtins(self):
         home = make_home()
