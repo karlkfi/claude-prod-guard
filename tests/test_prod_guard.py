@@ -448,10 +448,33 @@ class KubectlDecisionTests(unittest.TestCase):
         decision, _ = run_hook("kubectl config use-context gke_acme_prod-us")
         self.assertEqual(decision, "deny")
 
-    def test_use_context_nonprod_asks(self):
+    def test_use_context_nonprod_denied(self):
+        # Repointing the shared current-context is denied even for a non-prod
+        # target: the switch clobbers every parallel session.
         decision, reason = run_hook("kubectl config use-context kind-ci")
+        self.assertEqual(decision, "deny")
+        self.assertIn("kubectl --context <ctx>", reason)
+
+    def test_config_set_current_context_denied(self):
+        # `config set current-context` is `use-context` by another name.
+        decision, reason = run_hook("kubectl config set current-context kind-ci")
+        self.assertEqual(decision, "deny")
+        self.assertIn("kubectl --context <ctx>", reason)
+        decision, _ = run_hook(
+            "kubectl config set current-context gke_acme_prod-us")
+        self.assertEqual(decision, "deny")
+
+    def test_config_set_other_property_asks(self):
+        # Non-repointing kubeconfig edits still confirm rather than block.
+        decision, _ = run_hook(
+            "kubectl config set clusters.kind-ci.server https://127.0.0.1:6443")
         self.assertEqual(decision, "ask")
-        self.assertIn("shared", reason)
+
+    def test_use_context_override_downgrades_to_ask(self):
+        decision, reason = run_hook(
+            "PROD_GUARD_OVERRIDE=demo-setup kubectl config use-context kind-ci")
+        self.assertEqual(decision, "ask")
+        self.assertIn("override acknowledged", reason)
 
     def test_config_view_defers(self):
         decision, _ = run_hook("kubectl config view")
@@ -709,8 +732,16 @@ class GcloudTests(unittest.TestCase):
         decision, _ = run_hook("gcloud config set project acme-prod")
         self.assertEqual(decision, "deny")
 
-    def test_config_set_dev_project_asks(self):
-        decision, _ = run_hook("gcloud config set project acme-dev")
+    def test_config_set_dev_project_denied(self):
+        # Repointing the shared active configuration is denied even for a
+        # non-prod value: the switch clobbers every parallel session.
+        decision, reason = run_hook("gcloud config set project acme-dev")
+        self.assertEqual(decision, "deny")
+        self.assertIn("--project", reason)
+
+    def test_auth_login_asks(self):
+        # Credential writers have no per-command pin alternative: still ask.
+        decision, _ = run_hook("gcloud auth login")
         self.assertEqual(decision, "ask")
 
 
@@ -963,9 +994,10 @@ class AwsAzTests(unittest.TestCase):
         decision, _ = run_hook("az vm delete -n vm1 -g rg --yes", home=home)
         self.assertEqual(decision, "deny")
 
-    def test_az_account_set_asks(self):
-        decision, _ = run_hook("az account set --subscription acme-dev-sub")
-        self.assertEqual(decision, "ask")
+    def test_az_account_set_denied(self):
+        decision, reason = run_hook("az account set --subscription acme-dev-sub")
+        self.assertEqual(decision, "deny")
+        self.assertIn("az --subscription <id>", reason)
 
 
 class TerraformTests(unittest.TestCase):
@@ -1140,6 +1172,12 @@ class DockerTests(unittest.TestCase):
     def test_context_use_prod_denied(self):
         decision, _ = run_hook("docker context use prod-swarm")
         self.assertEqual(decision, "deny")
+
+    def test_context_use_nonprod_denied(self):
+        # Even a switch to a local-daemon context repoints shared state.
+        decision, reason = run_hook("docker context use colima")
+        self.assertEqual(decision, "deny")
+        self.assertIn("docker --context <ctx>", reason)
 
     def test_local_build_defers(self):
         decision, _ = run_hook("docker build -t app:dev .")
@@ -1349,9 +1387,10 @@ class ContextSwitcherTests(unittest.TestCase):
         decision, _ = run_hook("kubectx gke_acme_prod-us")
         self.assertEqual(decision, "deny")
 
-    def test_kubectx_nonprod_asks(self):
-        decision, _ = run_hook("kubectx kind-ci")
-        self.assertEqual(decision, "ask")
+    def test_kubectx_nonprod_denied(self):
+        decision, reason = run_hook("kubectx kind-ci")
+        self.assertEqual(decision, "deny")
+        self.assertIn("kubectl --context <ctx>", reason)
 
     def test_kubectx_bare_defers(self):
         decision, _ = run_hook("kubectx")
@@ -2083,11 +2122,14 @@ class SpecialCaseTests(unittest.TestCase):
         decision, _ = run_hook("kubectl config delete-context old-ctx")
         self.assertEqual(decision, "ask")
 
-    def test_kubectx_delete_and_previous_ask(self):
+    def test_kubectx_delete_asks_previous_denied(self):
+        # -d edits the kubeconfig without repointing it: still ask.
         decision, _ = run_hook("kubectx -d old-ctx")
         self.assertEqual(decision, "ask")
+        # `kubectx -` repoints to the previous context: denied like a named
+        # switch (the previous context's identity isn't even resolvable).
         decision, _ = run_hook("kubectx -")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
 
     def test_helm_push_registry_classified(self):
         decision, _ = run_hook(
@@ -2113,9 +2155,9 @@ class SpecialCaseTests(unittest.TestCase):
         decision, _ = run_hook("GH_REPO=acme/prod-app gh workflow run deploy")
         self.assertEqual(decision, "deny")
 
-    def test_gcloud_configurations_activate_asks(self):
+    def test_gcloud_configurations_activate_denied(self):
         decision, _ = run_hook("gcloud config configurations activate other")
-        self.assertEqual(decision, "ask")
+        self.assertEqual(decision, "deny")
         decision, _ = run_hook("gcloud config configurations list")
         self.assertIsNone(decision)
 
