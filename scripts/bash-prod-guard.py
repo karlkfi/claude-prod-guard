@@ -169,6 +169,31 @@ def load_patterns():
     return _PATTERNS
 
 
+_TRUTHY = frozenset({'1', 'true', 'yes', 'on'})
+
+
+def gh_strict_enabled(seg_env):
+    """True when gh's collaboration-metadata tier is opted out — every mutating
+    gh verb is prod-classified (the pre-#18 behavior), for issue-ops shops that
+    wire issue/PR comments to deployments. Turned on by a truthy
+    PROD_GUARD_GH_STRICT (segment env then process env) or `"gh_strict": true`
+    in any prod-guard.json config file. Strengthening-only: any source can turn
+    it on and none can turn it off, matching the additive config philosophy
+    (loosening the boundary must be a code change, not config drift)."""
+    val = seg_env.get('PROD_GUARD_GH_STRICT') or os.environ.get('PROD_GUARD_GH_STRICT')
+    if val and val.strip().lower() in _TRUTHY:
+        return True
+    for path in _config_paths():
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue  # fail OPEN on a bad/missing config; the tier stays on
+        if isinstance(data, dict) and data.get('gh_strict') is True:
+            return True
+    return False
+
+
 def classify(value):
     """'prod' | 'nonprod' | 'unknown' for a target string (context name,
     project id, profile, subscription, registry ref, repo slug...).
@@ -1072,6 +1097,37 @@ GH_READONLY = frozenset({
     'browse', 'version', 'auth', 'help', 'completion', 'clone', 'checkout',
 })
 
+# Every gh verb that mutates. Detection only — treated as mutating unless the
+# (resource, verb) pair lands in the collaboration tier below. Anything not
+# listed defers (unsure => not mutating is acceptable here: gh is denylist-only,
+# so an unrecognized verb was never going to deny anyway).
+GH_MUTATING_VERBS = frozenset({
+    'delete', 'merge', 'close', 'edit', 'create', 'comment', 'review',
+    'ready', 'lock', 'unlock', 'transfer', 'archive', 'unarchive', 'rename',
+    'set', 'run', 'rerun', 'cancel', 'enable', 'disable', 'sync', 'fork',
+    'reopen', 'upload', 'develop',
+})
+
+# Collaboration-metadata tier: mutating gh verbs with no path to an outage —
+# they never touch code, CI, releases, or infrastructure and are reversible
+# (close/edit/reopen). Keyed by the gh command (resource, `words[0]`); the value
+# is the set of subcommands that are collaboration-safe. A mutating gh command
+# in this tier DEFERS even against a prod-matching repo, because under-matching
+# a `gh issue create` costs nothing so the deny buys no safety (issue #18).
+# This is an allowlist, mirroring the read-only verb tables: any mutating
+# (resource, verb) NOT listed here stays prod-classified (deny on prod). The
+# opt-in `gh_strict` knob disables the whole tier for issue-ops shops that wire
+# comments to deploys. Verbs deliberately NOT here stay strict: `pr merge`,
+# `issue delete`/`transfer`/`lock`, `repo edit`, and everything under `release`,
+# `secret`, `variable`, `workflow`, `run`, `ruleset`, plus `lock`/`fork`/`sync`.
+GH_COLLAB_VERBS = {
+    'issue': frozenset({'create', 'edit', 'comment', 'close', 'reopen'}),
+    'pr': frozenset({'create', 'edit', 'comment', 'review', 'ready',
+                     'close', 'reopen'}),
+    'gist': frozenset({'create'}),
+    'label': frozenset({'create', 'edit', 'delete', 'clone'}),
+}
+
 ARGOCD_MUTATING = frozenset({
     'sync', 'create', 'delete', 'set', 'unset', 'rollback', 'patch', 'edit',
     'terminate-op', 'update', 'add', 'rm', 'remove', 'run',
@@ -1579,30 +1635,41 @@ def eval_gh(argv, seg_env, ctx):
     the cwd repo's origin remote — is pinned by the worktree, not shared
     clobberable state, and prompting on every `gh pr create` would be pure
     noise. So gh gets denylist-only treatment: a mutating gh command whose
-    resolved repo matches a prod pattern is denied; everything else defers."""
+    resolved repo matches a prod pattern is denied; everything else defers.
+
+    Mutating verbs are tiered (issue #18): collaboration metadata (`gh issue
+    create`, `gh pr comment`, label ops) has no path to an outage — reversible,
+    never touches code/CI/releases/infra — so it defers even against a prod
+    repo, buying no safety from a deny. Only the strict tier (`pr merge`, `repo
+    delete`, releases, secrets, workflows, `api` writes) prod-classifies. The
+    opt-in `gh_strict` knob folds the collaboration tier back into strict for
+    issue-ops shops that wire comments to deploys."""
     words = words_of(argv, ('-R', '--repo', '-t', '--title', '-b', '--body',
                             '-F', '--body-file', '-m', '--method', '-f', '-H'))
     action = action_of(argv, words)
     lw = [w.lower() for w in words]
-    mutating = False
-    if 'api' in lw[:1]:
-        method = (first_flag_value(argv, ('-X', '--method')) or 'GET').upper()
-        mutating = method in ('POST', 'PUT', 'PATCH', 'DELETE')
-    else:
-        mutating = any(
-            w in ('delete', 'merge', 'close', 'edit', 'create', 'comment',
-                  'review', 'ready', 'lock', 'unlock', 'transfer', 'archive',
-                  'unarchive', 'rename', 'set', 'run', 'rerun', 'cancel',
-                  'enable', 'disable', 'sync', 'fork', 'reopen')
-            for w in lw)
-        if lw and lw[0] in GH_READONLY:
-            mutating = False
-    if not mutating:
+    resource = lw[0] if lw else None
+    if resource is None or resource in GH_READONLY:
         return []
+    if resource == 'api':
+        method = (first_flag_value(argv, ('-X', '--method')) or 'GET').upper()
+        if method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            return []
+        # `api` can hit any endpoint, so a write is always prod-classified.
+    else:
+        if not any(w in GH_MUTATING_VERBS for w in lw):
+            return []
+        # Tier by the (resource, verb) pair — gh's grammar puts the verb at
+        # words[1] deterministically, so an unknown pair falls through to the
+        # strict tier (the secure default).
+        verb = lw[1] if len(lw) > 1 else None
+        collab = verb in GH_COLLAB_VERBS.get(resource, frozenset())
+        if collab and not gh_strict_enabled(seg_env):
+            return []
     candidates = [first_flag_value(argv, ('-R', '--repo'))
                   or seg_env.get('GH_REPO') or os.environ.get('GH_REPO')
                   or git_remote_url(ctx.get('cwd'))]
-    if lw[:1] == ['repo'] and len(words) > 2:
+    if resource == 'repo' and len(words) > 2:
         candidates.append(words[2])  # `gh repo delete OWNER/REPO` is positional
     for repo in candidates:
         if repo and classify(repo) == 'prod':
