@@ -1110,6 +1110,19 @@ class DockerTests(unittest.TestCase):
         self.assertIsNone(decision)
 
 
+def _prod_repo(home=None):
+    """A git repo whose origin remote resolves to a prod-matching slug — gh's
+    implied target when no `-R` is passed. Returns (home, repo_path)."""
+    if home is None:
+        home = make_home()
+    repo = os.path.join(home, "repo")
+    os.makedirs(repo)
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    subprocess.run(["git", "-C", repo, "remote", "add", "origin",
+                    "git@github.com:acme/prod-infra.git"], check=True)
+    return home, repo
+
+
 class GhTests(unittest.TestCase):
     def test_pr_create_defers_without_prod_remote(self):
         decision, _ = run_hook("gh pr create -t x -b y")
@@ -1124,12 +1137,7 @@ class GhTests(unittest.TestCase):
         self.assertIsNone(decision)
 
     def test_prod_remote_merge_denied(self):
-        home = make_home()
-        repo = os.path.join(home, "repo")
-        os.makedirs(repo)
-        subprocess.run(["git", "init", "-q", repo], check=True)
-        subprocess.run(["git", "-C", repo, "remote", "add", "origin",
-                        "git@github.com:acme/prod-infra.git"], check=True)
+        home, repo = _prod_repo()
         decision, _ = run_hook("gh pr merge 1 --squash", home=home, cwd=repo)
         self.assertEqual(decision, "deny")
 
@@ -1141,6 +1149,109 @@ class GhTests(unittest.TestCase):
         decision, _ = run_hook(
             "gh api -X DELETE repos/x/y -R acme/prod-infra")
         self.assertEqual(decision, "deny")
+
+    # --- Collaboration tier (issue #18): defers even against a prod repo. ---
+
+    def test_issue_create_prod_repo_defers(self):
+        decision, _ = run_hook(
+            "gh issue create -t bug -b oops -R acme/prod-infra")
+        self.assertIsNone(decision)
+
+    def test_issue_create_prod_remote_defers(self):
+        home, repo = _prod_repo()
+        decision, _ = run_hook("gh issue create -t bug -b oops",
+                               home=home, cwd=repo)
+        self.assertIsNone(decision)
+
+    def test_pr_create_prod_repo_defers(self):
+        decision, _ = run_hook("gh pr create -t x -b y -R acme/prod-infra")
+        self.assertIsNone(decision)
+
+    def test_pr_comment_prod_repo_defers(self):
+        decision, _ = run_hook("gh pr comment 5 -b lgtm -R acme/prod-infra")
+        self.assertIsNone(decision)
+
+    def test_pr_review_prod_repo_defers(self):
+        decision, _ = run_hook(
+            "gh pr review 5 --approve -R acme/prod-infra")
+        self.assertIsNone(decision)
+
+    def test_issue_edit_prod_repo_defers(self):
+        decision, _ = run_hook(
+            "gh issue edit 5 --add-label bug -R acme/prod-infra")
+        self.assertIsNone(decision)
+
+    def test_issue_close_prod_repo_defers(self):
+        decision, _ = run_hook("gh issue close 5 -R acme/prod-infra")
+        self.assertIsNone(decision)
+
+    def test_label_create_prod_repo_defers(self):
+        decision, _ = run_hook(
+            "gh label create bug -c FF0000 -R acme/prod-infra")
+        self.assertIsNone(decision)
+
+    def test_gist_create_defers(self):
+        home, repo = _prod_repo()
+        decision, _ = run_hook("gh gist create notes.txt",
+                               home=home, cwd=repo)
+        self.assertIsNone(decision)
+
+    # --- Strict tier: still denies on a prod repo. ---
+
+    def test_issue_delete_prod_repo_denied(self):
+        decision, _ = run_hook("gh issue delete 5 -R acme/prod-infra --yes")
+        self.assertEqual(decision, "deny")
+
+    def test_issue_transfer_prod_repo_denied(self):
+        decision, _ = run_hook(
+            "gh issue transfer 5 acme/other -R acme/prod-infra")
+        self.assertEqual(decision, "deny")
+
+    def test_pr_merge_prod_repo_denied(self):
+        decision, _ = run_hook("gh pr merge 5 --squash -R acme/prod-infra")
+        self.assertEqual(decision, "deny")
+
+    def test_release_create_prod_repo_denied(self):
+        decision, _ = run_hook("gh release create v1 -R acme/prod-infra")
+        self.assertEqual(decision, "deny")
+
+    def test_secret_set_prod_repo_denied(self):
+        decision, _ = run_hook("gh secret set TOKEN -R acme/prod-infra")
+        self.assertEqual(decision, "deny")
+
+    def test_workflow_run_prod_repo_denied(self):
+        decision, _ = run_hook("gh workflow run deploy -R acme/prod-infra")
+        self.assertEqual(decision, "deny")
+
+    def test_repo_edit_prod_repo_denied(self):
+        decision, _ = run_hook(
+            "gh repo edit --visibility public -R acme/prod-infra")
+        self.assertEqual(decision, "deny")
+
+    # --- gh_strict opt-in re-denies the collaboration tier. ---
+
+    def test_gh_strict_config_denies_issue_create(self):
+        home = make_home()
+        cdir = os.path.join(home, ".claude")
+        os.makedirs(cdir)
+        with open(os.path.join(cdir, "prod-guard.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"gh_strict": True}, f)
+        decision, _ = run_hook(
+            "gh issue create -t bug -b oops -R acme/prod-infra", home=home)
+        self.assertEqual(decision, "deny")
+
+    def test_gh_strict_env_denies_pr_comment(self):
+        decision, _ = run_hook(
+            "gh pr comment 5 -b hi -R acme/prod-infra",
+            env_extra={"PROD_GUARD_GH_STRICT": "1"})
+        self.assertEqual(decision, "deny")
+
+    def test_gh_strict_off_by_default_defers_collab(self):
+        decision, _ = run_hook(
+            "gh issue create -t bug -b oops -R acme/prod-infra",
+            env_extra={"PROD_GUARD_GH_STRICT": "0"})
+        self.assertIsNone(decision)
 
 
 class SshTests(unittest.TestCase):

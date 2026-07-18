@@ -187,7 +187,7 @@ because a missed destructive form is the failure mode that matters.
 | `az` | `--subscription` | default subscription in `~/.azure/azureProfile.json` |
 | `terraform` / `tofu` | `TF_WORKSPACE` | `.terraform/environment` in the working dir; the initialized backend's state location (S3/GCS bucket, Terraform Cloud org/workspace) from `.terraform/terraform.tfstate` is classified too, so a prod state location denies even behind an innocuous workspace name; `apply`/`destroy` are always treated as mutating |
 | `docker`, `podman`, `nerdctl`, `docker-compose` | `--context` / `--connection`, `DOCKER_HOST` / `CONTAINER_HOST` | `currentContext` in `~/.docker/config.json`; a local-daemon context defers. `docker push` classifies the image ref's registry; `build --push` classifies **every** `-t` tag; `compose push` fails closed (the registry lives in the compose file, which the hook doesn't parse) |
-| `gh` | `-R`/`--repo`, `GH_REPO` | the cwd repo's `origin` remote (denylist-only — see [Limitations](#limitations)) |
+| `gh` | `-R`/`--repo`, `GH_REPO` | the cwd repo's `origin` remote (denylist-only — see [Limitations](#limitations)). Mutating verbs are tiered: collaboration metadata (`issue`/`pr` create/edit/comment/review/close/reopen/ready, label ops, `gist create`) always defers — reversible, no path to an outage — while the strict tier (`pr merge`, `repo delete`/`edit`, `release`, `secret`/`variable set`, `workflow`/`run`, `api` writes) denies on a prod repo. Set `"gh_strict": true` to fold the collaboration tier back into strict |
 | `ssh` | destination host (`user@host`, `-J` jump host) | n/a — denylist-only: a prod destination is denied, everything else defers (see [Limitations](#limitations)) |
 | `argocd` | `--server` | `current-context` in `~/.config/argocd/config` |
 | `doctl` | `--context` | the doctl auth context (never read — an unpinned mutation denies, pin `--context`) |
@@ -251,9 +251,17 @@ Config file schema:
 ```json
 {
   "prod": ["^gke_acme-platform-prod_", "^acme-(platform|data)-prod", "argocd\\.acme\\.io"],
-  "nonprod": ["^gke_acme-platform-dev_", "^acme-sandbox-"]
+  "nonprod": ["^gke_acme-platform-dev_", "^acme-sandbox-"],
+  "gh_strict": false
 }
 ```
+
+`gh_strict` (boolean, default `false`) opts out of `gh`'s collaboration-metadata
+tier: with it on, every mutating `gh` verb — including `issue`/`pr`
+create/comment/edit — prod-classifies again, for orgs that wire issue or PR
+comments to deployments. It can also be set with `PROD_GUARD_GH_STRICT=1`.
+Like the pattern lists it is strengthening-only: any source can turn it on and
+none can turn it off (loosening the boundary is a code change, not config drift).
 
 A malformed config file loses only itself — the built-in patterns still
 apply, so a typo never removes the boundary (fail-open on infrastructure,
@@ -362,6 +370,16 @@ python3 scripts/friction-report.py --since 30d --repo gateway --top 20
   prod host is treated as mutating: an interactive prod shell is the blast
   radius, and a read-only remote command can't be distinguished from a
   destructive one.
+- `gh`'s mutating verbs are **tiered** (see the table above): collaboration
+  metadata — `gh issue`/`gh pr` create/edit/comment/review/close/reopen/ready,
+  label operations, `gh gist create` — never prod-classifies, because it's
+  reversible and has no path to an outage, so a deny would buy no safety while
+  costing a prompt. Only the strict tier (`pr merge`, `repo delete`/`edit`,
+  `release`, `secret`/`variable` writes, `workflow`/`run`, `api` POST/PUT/
+  PATCH/DELETE, and anything not recognized as collaboration) denies on a prod
+  repo. Orgs that wire issue/PR comments to deployments can opt the whole
+  collaboration tier back into strict with `"gh_strict": true` in
+  `.claude/prod-guard.json` (or `PROD_GUARD_GH_STRICT=1`).
 - The doctl auth context is not read from disk; a mutating command relying on
   it is denied (pin `--context`) rather than resolving the ambient value.
 - pulumi's selected stack is read from `~/.pulumi/workspaces/` (or `$PULUMI_HOME`)
