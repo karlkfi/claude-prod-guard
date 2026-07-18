@@ -39,6 +39,12 @@ workspace-guard and branch-guard default to `ask` because their false positives 
 
 A denylist that silently allows whatever it doesn't recognize protects only orgs whose production is literally named "prod". Real environments have GCP project ids, cluster names, and subscription GUIDs that no built-in pattern can anticipate. Prompting on unknown+mutating makes the gap visible exactly when it matters, and the fix (add a pattern) is one config line. The reverse default — allow on unknown — would make the guard decorative.
 
+### Why config outranks the built-in heuristics
+
+The built-in `prod` list is a *word-boundary heuristic*: it fires on any target containing `prod`/`prd`/`live` as a segment. That heuristic is well-calibrated for infrastructure locators (cluster contexts, project ids), where the name reliably tracks blast radius — but it also fires on names that merely mention prod tooling and gate nothing, the canonical case being a **code repository** named after prod tooling. `karlkfi/claude-prod-guard` matched the built-in prod pattern via its `-prod-` segment, so every mutating `gh` command against the guard's own repo (`gh pr create`, `gh issue create`) was denied ([issue #17](https://github.com/karlkfi/claude-prod-guard/issues/17)).
+
+The fix is a **precedence lattice**: config `prod` › config `nonprod` › built-in `prod` › built-in `nonprod`. A human-vetted config `nonprod` entry outranks the built-in prod *heuristic*, so `"nonprod": ["karlkfi/claude-prod-guard"]` clears the false positive for that slug and every future one — no per-command `PROD_GUARD_OVERRIDE`. This does not weaken the boundary: config remains additive to the *set* of patterns (it can add a regex, never delete a built-in), fail-closed ordering is preserved *within* each provenance tier (prod checked before nonprod), and a config `prod` entry still beats everything — so clearing a heuristic can never mask a target an operator has explicitly vetted as production. Narrowing the boundary stays an explicit, reviewable act (a committed `.claude/prod-guard.json` line), never a silent code default. The alternative — scoping the name heuristic away from `gh` repo slugs — is narrower and leaves the unclearable-built-in problem latent for every other tool, so the general precedence fix was chosen.
+
 ### Why an unpinned mutation is denied, not prompted
 
 A mutating command that names no explicit target (`kubectl delete pod x` with no
