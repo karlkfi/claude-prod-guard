@@ -1718,11 +1718,14 @@ class InfrastructureTests(unittest.TestCase):
         # issue #17: a repo slug matching the built-in prod heuristic (the
         # guard's own repo, `-prod-` segment) is denied for mutating gh
         # commands with no config, but a vetted config nonprod entry clears it.
+        # Uses a strict-tier verb (`release create`): the collaboration tier
+        # (issue #18) defers `issue create` regardless of repo, so it can no
+        # longer exercise the prod-vs-nonprod precedence this test guards.
         decision, _ = run_hook(
-            "gh -R karlkfi/claude-prod-guard issue create -t bug -b oops")
+            "gh -R karlkfi/claude-prod-guard release create v9 -t rel -b oops")
         self.assertEqual(decision, "deny")
         decision, _ = run_hook(
-            "gh -R karlkfi/claude-prod-guard issue create -t bug -b oops",
+            "gh -R karlkfi/claude-prod-guard release create v9 -t rel -b oops",
             env_extra={"PROD_GUARD_NONPROD_PATTERNS": "karlkfi/claude-prod-guard"})
         self.assertIsNone(decision)
 
