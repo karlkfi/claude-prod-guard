@@ -154,6 +154,19 @@ class CategoryTests(unittest.TestCase):
         # The override prefix does not change the underlying category.
         self.assertEqual(fr.category_of(REASON_OVERRIDE), "deny-prod")
 
+    def test_session_override_keeps_deny_prod_category(self):
+        # The session-override first-use ask carries the same 'override
+        # acknowledged' signature, so it counts as an override downgrade too.
+        reason = (
+            "prod-guard session override acknowledged "
+            "(PROD_GUARD_SESSION_OVERRIDE is set) — downgraded from deny to a "
+            "confirmation prompt. Approving records a session grant for "
+            "target(s) 'gke_acme_prod-us': further "
+            "PROD_GUARD_SESSION_OVERRIDE-prefixed commands against them in "
+            "this session will not re-prompt (expires after 8 h). "
+            + REASON_DENY_PROD)
+        self.assertEqual(fr.category_of(reason), "deny-prod")
+
 
 class TargetExtractionTests(unittest.TestCase):
     def test_extracts_quoted_target(self):

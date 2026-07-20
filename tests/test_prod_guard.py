@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from importlib import util
@@ -1854,10 +1855,10 @@ class BypassBatteryTests(unittest.TestCase):
         # negative (README Limitations). This test locks the bound so a
         # change to it is a conscious decision, not drift.
         guard._PATTERNS = None
-        findings, override = guard.evaluate_command_string(
+        findings, override, _session = guard.evaluate_command_string(
             "kubectl --context gke_acme_prod-us delete ns x", {"cwd": "/"}, depth=4)
         self.assertEqual(findings, [])
-        findings, _ = guard.evaluate_command_string(
+        findings, _, _session = guard.evaluate_command_string(
             "kubectl --context gke_acme_prod-us delete ns x", {"cwd": "/"}, depth=3)
         self.assertEqual(len(findings), 1)
 
@@ -2309,15 +2310,240 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(decision, "deny")
 
 
+def _event_payload(command, event, session_id, permission_mode=None):
+    payload = {"tool_name": "Bash", "tool_input": {"command": command},
+               "hook_event_name": event, "session_id": session_id}
+    if permission_mode:
+        payload["permission_mode"] = permission_mode
+    return payload
+
+
+class SessionOverrideTests(unittest.TestCase):
+    """PROD_GUARD_SESSION_OVERRIDE lifecycle: first use asks, an executed
+    (approved) command records a target-scoped grant via the PostToolUse
+    event, and later prefixed commands against granted targets defer. All
+    subprocess-based: commands are JSON strings, never executed."""
+
+    SID = "sess-1234"
+    CMD = ("PROD_GUARD_SESSION_OVERRIDE=e2e-pool-rebuild "
+           "kubectl --context gke_acme_prod-us delete ns x")
+
+    def grants_file(self, home, sid=None):
+        return Path(home) / ".claude" / "prod-guard" / "session-grants" / (
+            (sid or self.SID) + ".json")
+
+    def approve(self, home, command, sid=None):
+        """Simulate the human approving the ask: the command ran, so the
+        PostToolUse event fires and records the grant."""
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            command, "PostToolUse", sid or self.SID))
+        self.assertIsNone(decision)  # the post branch never emits a decision
+
+    def test_first_use_asks_and_names_the_grant(self):
+        home = make_home()
+        decision, reason = run_hook(None, home=home, payload=_event_payload(
+            self.CMD, "PreToolUse", self.SID))
+        self.assertEqual(decision, "ask")
+        self.assertIn("session override acknowledged", reason)
+        self.assertIn("gke_acme_prod-us", reason)
+
+    def test_approved_command_records_grant_and_next_defers(self):
+        home = make_home()
+        self.approve(home, self.CMD)
+        stored = json.loads(self.grants_file(home).read_text(encoding="utf-8"))
+        self.assertEqual(stored["grants"][0]["target"], "gke_acme_prod-us")
+        self.assertEqual(stored["grants"][0]["reason"], "e2e-pool-rebuild")
+        # A DIFFERENT mutating command against the granted target now defers.
+        cmd2 = ("PROD_GUARD_SESSION_OVERRIDE=e2e-pool-rebuild "
+                "kubectl --context gke_acme_prod-us label node n1 kata=on")
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            cmd2, "PreToolUse", self.SID))
+        self.assertIsNone(decision)
+
+    def test_unprefixed_command_still_denies_after_grant(self):
+        home = make_home()
+        self.approve(home, self.CMD)
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            "kubectl --context gke_acme_prod-us delete ns x",
+            "PreToolUse", self.SID))
+        self.assertEqual(decision, "deny")
+
+    def test_other_session_and_other_target_still_ask(self):
+        home = make_home()
+        self.approve(home, self.CMD)
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            self.CMD, "PreToolUse", "sess-other"))
+        self.assertEqual(decision, "ask")
+        other = ("PROD_GUARD_SESSION_OVERRIDE=e2e-pool-rebuild "
+                 "kubectl --context acme-prd-eu delete ns x")
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            other, "PreToolUse", self.SID))
+        self.assertEqual(decision, "ask")
+
+    def test_expired_grant_asks_again(self):
+        home = make_home()
+        gfile = self.grants_file(home)
+        gfile.parent.mkdir(parents=True)
+        expired = time.time() - guard.SESSION_GRANT_TTL - 60
+        gfile.write_text(json.dumps({"grants": [
+            {"target": "gke_acme_prod-us", "reason": "old", "ts": expired}]}),
+            encoding="utf-8")
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            self.CMD, "PreToolUse", self.SID))
+        self.assertEqual(decision, "ask")
+
+    def test_ambient_deny_is_never_grantable(self):
+        # Ambient prod context: prefixed command asks, but approval records
+        # nothing (ambient state can be repointed mid-session), so it asks
+        # again every time.
+        home = make_home(kubeconfig=KUBECONFIG_PROD)
+        cmd = "PROD_GUARD_SESSION_OVERRIDE=r kubectl delete ns x"
+        decision, reason = run_hook(None, home=home, payload=_event_payload(
+            cmd, "PreToolUse", self.SID))
+        self.assertEqual(decision, "ask")
+        self.assertIn("No session grant applies", reason)
+        self.approve(home, cmd)
+        self.assertFalse(self.grants_file(home).exists())
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            cmd, "PreToolUse", self.SID))
+        self.assertEqual(decision, "ask")
+
+    def test_switch_deny_is_never_grantable(self):
+        home = make_home()
+        cmd = ("PROD_GUARD_SESSION_OVERRIDE=r "
+               "kubectl config use-context gke_acme_prod-us")
+        self.approve(home, cmd)
+        self.assertFalse(self.grants_file(home).exists())
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            cmd, "PreToolUse", self.SID))
+        self.assertEqual(decision, "ask")
+
+    def test_multi_locator_grant_covers_all_components(self):
+        home = make_home()
+        cmd = ("PROD_GUARD_SESSION_OVERRIDE=r gcloud compute instances "
+               "delete vm1 --project acme-prod --zone us-east9-x")
+        self.approve(home, cmd)
+        stored = json.loads(self.grants_file(home).read_text(encoding="utf-8"))
+        self.assertEqual({g["target"] for g in stored["grants"]},
+                         {"acme-prod", "us-east9-x"})
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            cmd, "PreToolUse", self.SID))
+        self.assertIsNone(decision)
+        # A new, ungranted locator alongside the granted project re-asks.
+        cmd2 = ("PROD_GUARD_SESSION_OVERRIDE=r gcloud compute instances "
+                "delete vm1 --project acme-prod --zone us-west9-y")
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            cmd2, "PreToolUse", self.SID))
+        self.assertEqual(decision, "ask")
+
+    def test_partial_grant_still_prompts_for_the_rest(self):
+        home = make_home()
+        self.approve(home, self.CMD)
+        chain = (self.CMD +
+                 " && kubectl --context acme-prd-eu delete ns y")
+        decision, reason = run_hook(None, home=home, payload=_event_payload(
+            chain, "PreToolUse", self.SID))
+        self.assertEqual(decision, "ask")
+        self.assertIn("acme-prd-eu", reason)
+
+    def test_bypass_permissions_cannot_mint_or_use_first_ask(self):
+        # No human can answer an ask in bypassPermissions: the first use is a
+        # hard deny, so an unattended session can never mint a grant.
+        home = make_home()
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            self.CMD, "PreToolUse", self.SID, permission_mode="bypassPermissions"))
+        self.assertEqual(decision, "deny")
+
+    def test_granted_target_defers_even_in_bypass(self):
+        # The grant was minted by a human approval earlier in the session;
+        # suppression happens before the bypass escalation.
+        home = make_home()
+        self.approve(home, self.CMD)
+        decision, _ = run_hook(None, home=home, payload=_event_payload(
+            self.CMD, "PreToolUse", self.SID, permission_mode="bypassPermissions"))
+        self.assertIsNone(decision)
+
+    def test_readonly_prefixed_command_records_nothing(self):
+        home = make_home()
+        self.approve(home, "PROD_GUARD_SESSION_OVERRIDE=r "
+                           "kubectl --context gke_acme_prod-us get pods")
+        self.assertFalse(self.grants_file(home).exists())
+
+    def test_missing_session_id_degrades_to_per_command_ask(self):
+        home = make_home()
+        payload = {"tool_name": "Bash", "tool_input": {"command": self.CMD},
+                   "hook_event_name": "PreToolUse"}
+        decision, _ = run_hook(None, home=home, payload=payload)
+        self.assertEqual(decision, "ask")
+
+
+class SessionGrantStoreTests(unittest.TestCase):
+    """Unit tests for the grant store: every infrastructure failure must fail
+    toward MORE prompts (no grants loaded / nothing recorded), never fewer."""
+
+    def with_home(self):
+        home = tempfile.mkdtemp(prefix="prod-guard-grant-home-")
+        return home, unittest.mock.patch.dict(os.environ, {"HOME": home})
+
+    def test_record_then_load_roundtrip(self):
+        home, patcher = self.with_home()
+        with patcher:
+            guard.record_session_grants("s1", {"tgt-a", "tgt-b"}, "why", now=1000.0)
+            self.assertEqual(guard.load_session_grants("s1", now=1000.0),
+                             {"tgt-a", "tgt-b"})
+            # TTL boundary: valid at the edge, gone past it.
+            edge = 1000.0 + guard.SESSION_GRANT_TTL
+            self.assertEqual(guard.load_session_grants("s1", now=edge),
+                             {"tgt-a", "tgt-b"})
+            self.assertEqual(guard.load_session_grants("s1", now=edge + 1), set())
+
+    def test_first_grant_timestamp_never_slides(self):
+        home, patcher = self.with_home()
+        with patcher:
+            guard.record_session_grants("s1", {"tgt"}, "why", now=1000.0)
+            guard.record_session_grants("s1", {"tgt"}, "again", now=5000.0)
+            path = guard._session_grants_path("s1")
+            grants = json.loads(Path(path).read_text(encoding="utf-8"))["grants"]
+            self.assertEqual(len(grants), 1)
+            self.assertEqual(grants[0]["ts"], 1000.0)
+
+    def test_corrupt_store_loads_empty_and_recovers_on_write(self):
+        home, patcher = self.with_home()
+        with patcher:
+            path = Path(guard._session_grants_path("s1"))
+            path.parent.mkdir(parents=True)
+            path.write_text("{not json", encoding="utf-8")
+            self.assertEqual(guard.load_session_grants("s1"), set())
+            guard.record_session_grants("s1", {"tgt"}, "why", now=1000.0)
+            self.assertEqual(guard.load_session_grants("s1", now=1000.0), {"tgt"})
+
+    def test_unusable_session_ids_yield_no_store(self):
+        for sid in (None, "", "   ", 42):
+            self.assertIsNone(guard._session_grants_path(sid))
+            self.assertEqual(guard.load_session_grants(sid), set())
+
+    def test_session_id_is_sanitized_into_a_safe_filename(self):
+        # Path separators are stripped, so a hostile session id cannot
+        # escape the grants directory.
+        home, patcher = self.with_home()
+        with patcher:
+            path = guard._session_grants_path("../../evil/../x y")
+            grants_dir = os.path.join(home, ".claude", "prod-guard",
+                                      "session-grants")
+            self.assertEqual(os.path.dirname(path), grants_dir)
+            self.assertEqual(os.path.basename(path), ".._.._evil_.._x_y.json")
+
+
 class WiringTests(unittest.TestCase):
     def test_hooks_json_points_at_script(self):
         with open(REPO / "hooks" / "hooks.json", encoding="utf-8") as f:
             hooks = json.load(f)
-        entries = hooks["hooks"]["PreToolUse"]
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["matcher"], "Bash")
-        cmd = entries[0]["hooks"][0]["command"]
-        self.assertIn("scripts/bash-prod-guard.py", cmd)
+        for event in ("PreToolUse", "PostToolUse"):
+            entries = hooks["hooks"][event]
+            self.assertEqual(len(entries), 1, event)
+            self.assertEqual(entries[0]["matcher"], "Bash", event)
+            cmd = entries[0]["hooks"][0]["command"]
+            self.assertIn("scripts/bash-prod-guard.py", cmd, event)
         self.assertTrue(SCRIPT.exists())
 
     def test_plugin_and_marketplace_versions_match(self):

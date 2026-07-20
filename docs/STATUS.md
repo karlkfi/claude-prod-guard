@@ -12,9 +12,3 @@ Single source of truth for progress and priorities in prod-guard. Pick the next 
 | ID | Item | Labels | St | Sz | Notes |
 |---|---|---|---|---|---|
 | <a id="Q13"></a>Q13 | Surface a stale-version warning in the friction report | `docs` | 🔲 | S | Compare installed version (`installed_plugins.json`) against the marketplace clone's `plugin.json` and print "installed X, Y available", flagging staleness where users already look. From [#19](https://github.com/karlkfi/claude-prod-guard/issues/19). |
-
-## Deferred
-
-| ID | Item | Labels | Sz | Trigger to revive |
-|---|---|---|---|---|
-| <a id="Q12"></a>Q12 | Session-scoped override for the mixed prod/dev dogfood cluster | `security` | M | **Event:** a friction re-measurement after Q11's shell-variable expansion shows the dogfood cluster still drives most prompts. |

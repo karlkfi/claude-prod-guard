@@ -9,5 +9,5 @@
   "homepage": "https://github.com/karlkfi/claude-prod-guard",
   "repository": "https://github.com/karlkfi/claude-prod-guard",
   "license": "MIT",
-  "keywords": ["claude-code", "hooks", "security", "guardrail", "production", "kubernetes", "kubectl", "helm", "terraform", "gcloud", "aws", "azure", "docker", "ssh", "pulumi", "ansible", "devops", "sre", "command", "friction"]
+  "keywords": ["claude-code", "hooks", "security", "guardrail", "production", "kubernetes", "kubectl", "helm", "terraform", "gcloud", "aws", "azure", "docker", "ssh", "pulumi", "ansible", "devops", "sre", "command", "friction", "override", "session"]
 }

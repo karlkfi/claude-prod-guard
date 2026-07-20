@@ -26,7 +26,13 @@ Decision semantics (per simple command; worst verdict wins across a chain):
     (no output; normal permission settings apply — this guard never emits
     `allow`, so it composes with other guards instead of overriding them).
   * mutating verb + target classified PROD                      -> **deny**,
-    downgradable to `ask` with a `PROD_GUARD_OVERRIDE=<reason>` prefix.
+    downgradable to `ask` with a `PROD_GUARD_OVERRIDE=<reason>` prefix — or
+    with `PROD_GUARD_SESSION_OVERRIDE=<reason>`, which additionally records a
+    session-scoped grant for the explicit prod target(s) once the human
+    approves (detected by the PostToolUse hook: it only fires if the command
+    ran). Later prefixed commands against granted targets in the same session
+    defer silently; unprefixed commands, other targets, other sessions, and
+    expired grants (8 h TTL) still deny/ask as usual.
   * mutating verb + explicit target that matches no pattern     -> **ask**
     (fail CLOSED on the security decision: unknown is never silently allowed).
   * mutating verb + no explicit target (ambient context)        -> **deny**
@@ -67,6 +73,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 # ---------------------------------------------------------------------------
 # Target classification: PROD / NONPROD / UNKNOWN
@@ -981,6 +988,103 @@ def pulumi_selected_stack(seg_env, cwd):
 
 
 # ---------------------------------------------------------------------------
+# Session-scoped override grants
+# ---------------------------------------------------------------------------
+# A PROD_GUARD_SESSION_OVERRIDE=<reason> prefix asks like PROD_GUARD_OVERRIDE
+# does, but once the human approves and the command actually runs (detected by
+# the PostToolUse hook — it never fires for a denied ask), the explicit prod
+# targets it hit are granted for the rest of the session. Later prefixed
+# commands whose deny findings are fully covered by grants defer silently.
+# Grants are exact-string, per-session, and bounded by a TTL; only explicit
+# targets are ever grantable (ambient state can be repointed mid-session, and
+# shared-state switches clobber every parallel session).
+
+SESSION_GRANT_TTL = 8 * 3600      # a grant outlives a workday session, not a resumed one
+_GRANT_FILE_MAX_AGE = 7 * 86400   # stale session files swept opportunistically
+
+
+def _session_grants_path(session_id):
+    """State file for one session's grants, or None when it can't exist
+    (no HOME, no usable session id)."""
+    home = os.environ.get('HOME')
+    if not home or not isinstance(session_id, str) or not session_id.strip():
+        return None
+    slug = re.sub(r'[^A-Za-z0-9._-]', '_', session_id.strip())[:80]
+    return os.path.join(home, '.claude', 'prod-guard', 'session-grants',
+                        slug + '.json')
+
+
+def load_session_grants(session_id, now=None):
+    """The session's unexpired granted targets as a set. Any error — missing
+    file, bad JSON, wrong shape — returns the empty set: a broken store means
+    more prompts, never fewer (fail closed on the security decision)."""
+    path = _session_grants_path(session_id)
+    if path is None:
+        return set()
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        grants = data.get('grants', [])
+    except (OSError, ValueError, AttributeError):
+        return set()
+    now = time.time() if now is None else now
+    out = set()
+    for g in grants:
+        if not isinstance(g, dict):
+            continue
+        target, ts = g.get('target'), g.get('ts')
+        if isinstance(target, str) and isinstance(ts, (int, float)) \
+                and 0 <= now - ts <= SESSION_GRANT_TTL:
+            out.add(target)
+    return out
+
+
+def record_session_grants(session_id, targets, reason, now=None):
+    """Append grants for `targets` not already on record (first-grant timestamp
+    is kept — the TTL never slides). Atomic replace so a torn write can't
+    corrupt the store; any failure is silent and loses only the recording
+    (the next command re-prompts)."""
+    path = _session_grants_path(session_id)
+    if path is None or not targets:
+        return
+    now = time.time() if now is None else now
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+            grants = [g for g in data.get('grants', []) if isinstance(g, dict)]
+        except (OSError, ValueError, AttributeError):
+            grants = []
+        have = {g.get('target') for g in grants}
+        for t in sorted(targets):
+            if t not in have:
+                grants.append({'target': t, 'reason': reason, 'ts': now})
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'grants': grants}, f)
+        os.replace(tmp, path)
+        _sweep_stale_grant_files(os.path.dirname(path), now)
+    except OSError:
+        return
+
+
+def _sweep_stale_grant_files(dirpath, now):
+    """Best-effort hygiene: drop session files old enough that their grants
+    all expired long ago."""
+    try:
+        for name in os.listdir(dirpath):
+            p = os.path.join(dirpath, name)
+            try:
+                if now - os.path.getmtime(p) > _GRANT_FILE_MAX_AGE:
+                    os.unlink(p)
+            except OSError:
+                continue
+    except OSError:
+        return
+
+
+# ---------------------------------------------------------------------------
 # Findings and policy
 # ---------------------------------------------------------------------------
 
@@ -990,13 +1094,18 @@ CONFIG_HINT = ('Patterns: built-ins plus .claude/prod-guard.json '
                '(see the prod-guard README).')
 
 
-def deny_prod(action, target_desc):
+def deny_prod(action, target_desc, grant_targets=None):
+    """`grant_targets` (tuple of target strings) marks the finding as
+    session-grantable: it is passed only when the prod classification came
+    from an explicit pin, never for ambient resolutions or shared-state
+    switches — those must re-prompt every time."""
     return (DENY,
             'prod-guard: `%s` targets %s, which matches a production pattern. '
             'Mutating commands against production targets are blocked. If this '
             'is intentional, prefix the command with PROD_GUARD_OVERRIDE=<reason> '
             'to downgrade the block to a confirmation prompt. %s'
-            % (action, target_desc, CONFIG_HINT))
+            % (action, target_desc, CONFIG_HINT),
+            tuple(grant_targets) if grant_targets else None)
 
 
 def ask_unknown(action, target_desc):
@@ -1005,7 +1114,8 @@ def ask_unknown(action, target_desc):
             'nor a non-production pattern — unknown targets are never silently '
             'allowed. Confirm it is safe, or add a nonprod pattern to '
             '.claude/prod-guard.json to classify it. %s'
-            % (action, target_desc, CONFIG_HINT))
+            % (action, target_desc, CONFIG_HINT),
+            None)
 
 
 def deny_ambient(action, ambient_desc, pin_hint):
@@ -1016,7 +1126,8 @@ def deny_ambient(action, ambient_desc, pin_hint):
             'their target explicitly: add %s and retry. To run against the '
             'ambient target anyway, prefix the command with '
             'PROD_GUARD_OVERRIDE=<reason> for a confirmation prompt.'
-            % (action, ambient_desc, pin_hint))
+            % (action, ambient_desc, pin_hint),
+            None)
 
 
 def deny_switch(action, what, pin_hint):
@@ -1031,7 +1142,8 @@ def deny_switch(action, what, pin_hint):
             'the target per command with %s instead. If the switch is '
             'genuinely intended, prefix the command with '
             'PROD_GUARD_OVERRIDE=<reason> for a confirmation prompt.'
-            % (action, what, pin_hint))
+            % (action, what, pin_hint),
+            None)
 
 
 def ask_switch(action, what):
@@ -1043,7 +1155,8 @@ def ask_switch(action, what):
             'on this machine — parallel sessions relying on ambient context '
             'will silently follow it. Prefer per-command pinning '
             '(--context/--project/--profile) over switching shared state.'
-            % (action, what))
+            % (action, what),
+            None)
 
 
 def policy(action, explicit_value, explicit_desc,
@@ -1055,7 +1168,7 @@ def policy(action, explicit_value, explicit_desc,
     if explicit_value is not None:
         cls = classify_fn(explicit_value)
         if cls == 'prod':
-            return deny_prod(action, explicit_desc)
+            return deny_prod(action, explicit_desc, (explicit_value,))
         if cls == 'nonprod':
             return None
         return ask_unknown(action, explicit_desc)
@@ -1318,7 +1431,7 @@ def eval_helm(argv, seg_env, ctx):
         remote = words[-1] if len(words) >= 3 else None
         cls = classify(remote)
         if cls == 'prod':
-            return [deny_prod(action, "registry '%s'" % remote)]
+            return [deny_prod(action, "registry '%s'" % remote, (remote,))]
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "registry '%s'" % (remote or '<unresolved>'))]
@@ -1408,7 +1521,8 @@ def eval_gcloud(argv, seg_env, ctx):
         descs = ', '.join("'%s'" % v for v in values)
         classes = [classify(v) for v in values]
         if 'prod' in classes:
-            return [deny_prod(action, 'the gcloud project/locator %s' % descs)]
+            return [deny_prod(action, 'the gcloud project/locator %s' % descs,
+                              tuple(values))]
         if 'nonprod' in classes:
             return []
         return [ask_unknown(action, 'the gcloud project/locator %s' % descs)]
@@ -1465,12 +1579,14 @@ def eval_aws(argv, seg_env, ctx):
     region = first_flag_value(argv, ('--region',))
     if profile:
         desc = "aws profile '%s'" % profile
+        targets = (profile,)
         cls = classify(profile)
         if cls == 'unknown' and region:
             cls = classify(region)
             desc = "aws profile '%s' / region '%s'" % (profile, region)
+            targets = (profile, region)
         if cls == 'prod':
-            return [deny_prod(action, desc)]
+            return [deny_prod(action, desc, targets)]
         if cls == 'nonprod':
             return []
         # Name (and region) told us nothing. Resolve where `[profile NAME]`
@@ -1479,7 +1595,7 @@ def eval_aws(argv, seg_env, ctx):
         # nonprod/unknown/unresolvable profile keeps the by-name ask below.
         named_prod = aws_named_profile_prod(profile, seg_env)
         if named_prod:
-            return [deny_prod(action, named_prod)]
+            return [deny_prod(action, named_prod, (profile,))]
         return [ask_unknown(action, desc)]
     # No explicit profile pinned: the target is the `[default]` profile, whose
     # sso_start_url / role_arn / sso_session in ~/.aws/config name the account
@@ -1515,7 +1631,7 @@ def eval_az(argv, seg_env, ctx):
     if sub:
         cls = classify(sub)
         if cls == 'prod':
-            return [deny_prod(action, "azure subscription '%s'" % sub)]
+            return [deny_prod(action, "azure subscription '%s'" % sub, (sub,))]
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "azure subscription '%s'" % sub)]
@@ -1559,7 +1675,8 @@ def eval_terraform(argv, seg_env, ctx):
     if ws:
         cls = classify(ws)
         if cls == 'prod':
-            return [deny_prod(action, "terraform workspace '%s' (TF_WORKSPACE)" % ws)]
+            return [deny_prod(action, "terraform workspace '%s' (TF_WORKSPACE)" % ws,
+                              (ws,))]
         backend = terraform_backend_prod(cwd)
         if backend:
             return [deny_prod(action, backend)]
@@ -1608,7 +1725,7 @@ def eval_docker(argv, seg_env, ctx):
         ref = words[1] if len(words) > 1 else None
         cls = classify(ref)
         if cls == 'prod':
-            return [deny_prod(action, "image ref '%s'" % ref)]
+            return [deny_prod(action, "image ref '%s'" % ref, (ref,))]
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "image ref '%s'" % (ref or '<unresolved>'))]
@@ -1635,7 +1752,7 @@ def eval_docker(argv, seg_env, ctx):
             classes = [classify(t) for t in tags]
             if 'prod' in classes:
                 bad = tags[classes.index('prod')]
-                return [deny_prod(action, "image tag '%s'" % bad)]
+                return [deny_prod(action, "image tag '%s'" % bad, (bad,))]
             if tags and all(c == 'nonprod' for c in classes):
                 return []
             unknowns = [t for t, c in zip(tags, classes) if c == 'unknown']
@@ -1657,7 +1774,8 @@ def eval_docker(argv, seg_env, ctx):
     if explicit:
         cls = classify(explicit)
         if cls == 'prod':
-            return [deny_prod(action, "docker context/host '%s'" % explicit)]
+            return [deny_prod(action, "docker context/host '%s'" % explicit,
+                              (explicit,))]
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "docker context/host '%s'" % explicit)]
@@ -1716,7 +1834,7 @@ def eval_gh(argv, seg_env, ctx):
         candidates.append(words[2])  # `gh repo delete OWNER/REPO` is positional
     for repo in candidates:
         if repo and classify(repo) == 'prod':
-            return [deny_prod(action, "repository '%s'" % repo)]
+            return [deny_prod(action, "repository '%s'" % repo, (repo,))]
     return []
 
 
@@ -1779,7 +1897,7 @@ def eval_ssh(argv, seg_env, ctx):
     action = 'ssh %s' % dest if dest else 'ssh'
     for h in hosts:
         if h and classify(h) == 'prod':
-            return [deny_prod(action, "host '%s'" % h)]
+            return [deny_prod(action, "host '%s'" % h, (h,))]
     return []
 
 
@@ -1804,7 +1922,7 @@ def eval_argocd(argv, seg_env, ctx):
     if server:
         cls = classify(server)
         if cls == 'prod':
-            return [deny_prod(action, "argocd server '%s'" % server)]
+            return [deny_prod(action, "argocd server '%s'" % server, (server,))]
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "argocd server '%s'" % server)]
@@ -1833,7 +1951,8 @@ def eval_eksctl(argv, seg_env, ctx):
         descs = ', '.join("'%s'" % v for v in values)
         classes = [classify(v) for v in values]
         if 'prod' in classes:
-            return [deny_prod(action, 'the eks cluster/profile %s' % descs)]
+            return [deny_prod(action, 'the eks cluster/profile %s' % descs,
+                              tuple(values))]
         if 'nonprod' in classes:
             return []
         return [ask_unknown(action, 'the eks cluster/profile %s' % descs)]
@@ -1860,7 +1979,7 @@ def eval_doctl(argv, seg_env, ctx):
     if ctx_name:
         cls = classify(ctx_name)
         if cls == 'prod':
-            return [deny_prod(action, "doctl context '%s'" % ctx_name)]
+            return [deny_prod(action, "doctl context '%s'" % ctx_name, (ctx_name,))]
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "doctl context '%s'" % ctx_name)]
@@ -1892,7 +2011,7 @@ def _pulumi_decide(action, explicit, seg_env, ctx):
     if explicit is not None:
         cls = classify(explicit)
         if cls == 'prod':
-            return [deny_prod(action, "pulumi stack '%s'" % explicit)]
+            return [deny_prod(action, "pulumi stack '%s'" % explicit, (explicit,))]
         if cls == 'nonprod':
             return []
         return [ask_unknown(action, "pulumi stack '%s'" % explicit)]
@@ -2023,7 +2142,7 @@ def eval_ansible(argv, seg_env, ctx):
               else os.path.basename(argv[0]))
     for t in invs + escalators:
         if classify(t) == 'prod':
-            return [deny_prod(action, "the ansible target '%s'" % t)]
+            return [deny_prod(action, "the ansible target '%s'" % t, (t,))]
     if invs:
         for v in invs:
             if classify(v) == 'unknown':
@@ -2086,14 +2205,17 @@ def evaluate_command_string(raw, ctx, depth=0, exported=None):
     `eval ...` bodies so a quoted nested command can't ride past the guard;
     the recursion passes the invoking segment's exported env so `$VAR` in the
     body resolves as a child process would see it. Returns
-    (findings, override_seen)."""
+    (findings, override_seen, session_reason) — session_reason is the value of
+    the first inline PROD_GUARD_SESSION_OVERRIDE assignment, or None when the
+    prefix is absent."""
     findings = []
     override = False
+    session_reason = None
     if depth > 3:
-        return findings, override
+        return findings, override, session_reason
     tokens = tokenize(raw)
     if tokens is None:
-        return findings, override  # unparseable: fail-open
+        return findings, override, session_reason  # unparseable: fail-open
     # Two scopes, both seeded from what this shell inherited (os.environ at the
     # top level, the invoking segment's exported env for a nested `sh -c`/`eval`
     # body):
@@ -2120,6 +2242,8 @@ def evaluate_command_string(raw, ctx, depth=0, exported=None):
         child_env = {**exported, **seg_inline}     # for its `sh -c`/`eval` body
         if 'PROD_GUARD_OVERRIDE' in seg_inline:
             override = True
+        if 'PROD_GUARD_SESSION_OVERRIDE' in seg_inline and session_reason is None:
+            session_reason = seg_inline['PROD_GUARD_SESSION_OVERRIDE']
         # Expanded view for classification; raw view (nested-body extraction)
         # is left unexpanded so the child re-expands it against child_env.
         argv = strip_wrappers(expand_argv(argv_raw, same_shell), seg_inline)
@@ -2143,15 +2267,17 @@ def evaluate_command_string(raw, ctx, depth=0, exported=None):
             # inheriting only exported vars.
             body = first_flag_value(argv_raw, ('-c',))
             if body:
-                sub_f, sub_o = evaluate_command_string(body, ctx, depth + 1, child_env)
+                sub_f, sub_o, sub_s = evaluate_command_string(body, ctx, depth + 1, child_env)
                 findings += sub_f
                 override = override or sub_o
+                session_reason = session_reason if session_reason is not None else sub_s
             continue
         if tool == 'eval':
-            sub_f, sub_o = evaluate_command_string(
+            sub_f, sub_o, sub_s = evaluate_command_string(
                 ' '.join(argv_raw[1:]), ctx, depth + 1, child_env)
             findings += sub_f
             override = override or sub_o
+            session_reason = session_reason if session_reason is not None else sub_s
             continue
         evaluator = EVALUATORS.get(tool)
         if evaluator is None:
@@ -2159,7 +2285,7 @@ def evaluate_command_string(raw, ctx, depth=0, exported=None):
         if len(argv) == 1:
             continue  # bare tool name prints help; nothing to guard
         findings += evaluator(argv, seg_inline, ctx)
-    return findings, override
+    return findings, override, session_reason
 
 
 def main():
@@ -2176,20 +2302,65 @@ def main():
         return
 
     ctx = {'cwd': data.get('cwd') or os.getcwd()}
-    findings, override = evaluate_command_string(command, ctx)
+
+    if data.get('hook_event_name') == 'PostToolUse':
+        # The command RAN — so if PreToolUse downgraded a deny to an ask, the
+        # human approved it. Record session grants for the explicit prod
+        # targets it hit; nothing is ever emitted from this branch.
+        if 'PROD_GUARD_SESSION_OVERRIDE' not in command:
+            return
+        findings, _, session_reason = evaluate_command_string(command, ctx)
+        if session_reason is None:
+            return
+        targets = {t for sev, _r, gts in findings if sev == DENY and gts
+                   for t in gts}
+        record_session_grants(data.get('session_id'), targets, session_reason)
+        return
+
+    findings, override, session_reason = evaluate_command_string(command, ctx)
     if not findings:
         return  # nothing to object to: defer to normal permissions
 
-    severity = max(sev for sev, _ in findings)
+    grantable = []
+    if session_reason is not None:
+        granted = load_session_grants(data.get('session_id'))
+        # Drop deny findings whose explicit prod targets were ALL granted
+        # earlier this session; what survives decides as usual.
+        findings = [f for f in findings
+                    if not (f[0] == DENY and f[2]
+                            and all(t in granted for t in f[2]))]
+        if not findings:
+            return  # every finding covered by a session grant: silent defer
+        grantable = sorted({t for sev, _r, gts in findings
+                            if sev == DENY and gts for t in gts})
+
+    severity = max(sev for sev, _r, _t in findings)
     # De-duplicate reasons while keeping order; cap so the prompt stays readable.
     reasons, seen = [], set()
-    for sev, reason in sorted(findings, key=lambda f: -f[0]):
+    for sev, reason, _t in sorted(findings, key=lambda f: -f[0]):
         if reason not in seen:
             seen.add(reason)
             reasons.append(reason)
     reason = ' | '.join(reasons[:3])
 
-    if severity == DENY and override:
+    if severity == DENY and session_reason is not None:
+        severity = ASK
+        if grantable:
+            grant_note = (
+                'Approving records a session grant for target(s) %s: further '
+                'PROD_GUARD_SESSION_OVERRIDE-prefixed commands against them '
+                'in this session will not re-prompt (expires after %d h). '
+                % (', '.join("'%s'" % t for t in grantable),
+                   SESSION_GRANT_TTL // 3600))
+        else:
+            grant_note = (
+                'No session grant applies here — only explicit production '
+                'targets are session-grantable; ambient-context and '
+                'shared-state-switch blocks confirm every time. ')
+        reason = ('prod-guard session override acknowledged '
+                  '(PROD_GUARD_SESSION_OVERRIDE is set) — downgraded from '
+                  'deny to a confirmation prompt. ' + grant_note + reason)
+    elif severity == DENY and override:
         severity = ASK
         reason = ('prod-guard override acknowledged (PROD_GUARD_OVERRIDE is '
                   'set) — downgraded from deny to a confirmation prompt. '

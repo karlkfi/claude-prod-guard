@@ -1,10 +1,11 @@
 # Privacy Policy — prod-guard
 
-_Last updated: 2026-07-04_
+_Last updated: 2026-07-19_
 
 prod-guard is a Claude Code plugin that runs entirely on your local machine
-as a `PreToolUse` hook. Its only job is to block or add a confirmation
-prompt before certain Bash commands mutate infrastructure targets.
+as a `PreToolUse` hook (plus a `PostToolUse` hook that records session-scoped
+override grants). Its only job is to block or add a confirmation prompt
+before certain Bash commands mutate infrastructure targets.
 
 ## Data we collect
 
@@ -27,8 +28,13 @@ ships as a single Python script that uses only the standard library.
 - It processes these **in memory** to decide deny / ask / defer, then writes
   the decision to standard output. It does **not** read credentials, tokens,
   or any other content from those files.
-- It never runs the guarded tools, never contacts a cluster or cloud API,
-  and writes nothing to disk.
+- It never runs the guarded tools and never contacts a cluster or cloud API.
+- The only thing it writes to disk is the local session-override grant store,
+  `~/.claude/prod-guard/session-grants/<session-id>.json` — created only when
+  you approve a `PROD_GUARD_SESSION_OVERRIDE=<reason>` command. Each file
+  holds the target names you approved, the reason you gave, and a timestamp;
+  grants expire after 8 hours, stale files are cleaned up automatically, and
+  you can delete the directory at any time. Nothing leaves your machine.
 
 ## The friction-report command
 

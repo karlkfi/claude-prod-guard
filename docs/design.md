@@ -39,6 +39,45 @@ A `PreToolUse` hook on `Bash` that:
 
 workspace-guard and branch-guard default to `ask` because their false positives are routine and their worst case is usually recoverable (a file read, a commit that can be reverted). prod-guard's worst case is a production outage or data loss — irreversible and organization-visible. The asymmetry justifies the harder default: a false-positive deny costs one `PROD_GUARD_OVERRIDE=` prefix and one confirmation; a false-negative allow can cost an incident. The override keeps intentional prod work possible in exactly one deliberate, auditable step — the reason travels in the command line itself.
 
+### Why the session-scoped override is target-scoped and minted by approval
+
+The per-command override re-litigates a decision the human already made: a
+sanctioned batch (an incident, a planned node-pool rebuild) states the same
+justification N times for N commands of one approved task. A 2026-07 friction
+re-measurement ([issue #26](https://github.com/karlkfi/claude-prod-guard/issues/26))
+showed a single mixed prod/dev cluster driving 20 of 37 prompts, every one an
+intentional, correctly-justified `PROD_GUARD_OVERRIDE` — pure re-confirmation
+cost, not misclassification. `PROD_GUARD_SESSION_OVERRIDE=<reason>` keeps the
+first-command speed bump and removes only the repeats.
+
+Each boundary of the grant is chosen for a reason:
+
+- **Minted only by an executed command.** A PreToolUse hook cannot see whether
+  its `ask` was approved or rejected, so recording a grant there would also
+  grant a *rejected* prompt. The PostToolUse hook fires only if the command
+  actually ran — running is the proof of approval. In `bypassPermissions`
+  mode the first use is already escalated to a hard deny, so no unattended
+  session can mint a grant.
+- **Exact target, not session-wide.** Approving the dogfood cluster must not
+  silently clear a later `--context prod-us`. A multi-locator command (gcloud
+  project + zone) records all its locators together, and suppression requires
+  *all* of a finding's targets to be granted.
+- **The prefix stays required.** The reason travels in the command line
+  itself (the same auditability argument as the per-command override), and a
+  prod mutation that *doesn't* declare itself part of the sanctioned batch
+  still denies.
+- **Only explicit targets are grantable.** An ambient-resolved prod target is
+  clobber-prone shared state — the thing threat model 2 exists for — and a
+  shared-state switch clobbers every parallel session; both re-prompt every
+  time. Unknown targets keep asking too: the durable fix is classification,
+  not a grant.
+- **Suppression is silence, never `allow`**, so normal permission settings
+  and sibling guards still apply; and every grant-store failure fails toward
+  *more* prompts (unreadable store → no grants; unwritable store → nothing
+  recorded), preserving the fail-closed direction on the security decision.
+- **8-hour TTL, no sliding refresh.** A resumed session days later reuses its
+  session id; without a bound, a stale approval would silently reactivate.
+
 ### Why fail-closed on unknown targets
 
 A denylist that silently allows whatever it doesn't recognize protects only orgs whose production is literally named "prod". Real environments have GCP project ids, cluster names, and subscription GUIDs that no built-in pattern can anticipate. Prompting on unknown+mutating makes the gap visible exactly when it matters, and the fix (add a pattern) is one config line. The reverse default — allow on unknown — would make the guard decorative.
