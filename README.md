@@ -127,6 +127,9 @@ across `&&`/`|`/`;`/`$( )` chains):
 | `kubectx prod-us` | **deny** |
 | `gcloud auth login` | **ask** |
 | `PROD_GUARD_OVERRIDE=incident-42 kubectl --context prod-us delete ns x` | **ask** |
+| `PROD_GUARD_SESSION_OVERRIDE=drill-7 kubectl --context prod-us delete ns x` (first use) | **ask** (approval grants `prod-us` for the session) |
+| `PROD_GUARD_SESSION_OVERRIDE=drill-7 kubectl --context prod-us cordon n1` (after that approval, same session) | defer |
+| `kubectl --context prod-us drain n1` (grant exists, but no prefix) | **deny** |
 
 ## Install
 
@@ -348,6 +351,38 @@ override — with its reason on the record in the command itself — and the
 human approves or rejects the prompt. The override never turns a deny into a
 silent allow, and it has no effect on plain asks.
 
+### Session-scoped override
+
+A sanctioned *batch* of production commands (an incident, a planned node-pool
+rebuild) shouldn't re-confirm the same justification N times.
+`PROD_GUARD_SESSION_OVERRIDE=<reason>` asks exactly like `PROD_GUARD_OVERRIDE`
+on first use — but once you approve that prompt and the command runs, the
+explicit production target(s) it named are **granted for the rest of the
+session**: further commands *prefixed the same way* against those targets
+defer silently (your normal permission settings still apply — the guard never
+emits `allow`).
+
+```
+PROD_GUARD_SESSION_OVERRIDE=pool-rebuild-approved kubectl --context prod-us delete node old-1   # ask once
+PROD_GUARD_SESSION_OVERRIDE=pool-rebuild-approved kubectl --context prod-us cordon old-2        # defers
+```
+
+The scope is deliberately narrow:
+
+- **Per session, per exact target, 8-hour cap.** Another session, another
+  target, or an expired grant asks again.
+- **The prefix is required on every command** — the reason stays on the
+  record in the command line, and an unprefixed prod mutation still denies.
+- **Only explicit targets are grantable.** Ambient-context denies,
+  shared-state switch denies, and unknown-target asks re-prompt every time.
+- **A grant can only be minted by a human approval.** The recording hook
+  fires only if the command actually ran, and in `bypassPermissions` mode
+  the first use is a hard deny — unattended sessions can't self-grant.
+
+Grants live in `~/.claude/prod-guard/session-grants/<session-id>.json`
+(local only, see [PRIVACY.md](PRIVACY.md)); delete a file to revoke its
+session's grants early.
+
 ## Agent guidance: avoiding prompts
 
 Paste this into your project's `CLAUDE.md` (or `AGENTS.md`) so the agent
@@ -379,7 +414,10 @@ flag to add. To keep work flowing:
   of approving repeatedly.
 - **Production mutations are blocked.** If one is genuinely intended, ask
   the user; with their sign-off, prefix the command with
-  `PROD_GUARD_OVERRIDE=<reason>` and they will confirm via the prompt.
+  `PROD_GUARD_OVERRIDE=<reason>` and they will confirm via the prompt. For a
+  sanctioned *batch* of commands against the same target, use
+  `PROD_GUARD_SESSION_OVERRIDE=<reason>` on every command instead: the user
+  confirms once and the rest of the batch flows without re-prompting.
 ```
 
 ## Measuring friction
